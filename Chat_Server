@@ -1,1 +1,1074 @@
 
+//! # Industrial Multi-Threaded TCP Binary Chat System
+//!
+//! A high-performance, resilient TCP chat server and integrated client implementation
+//! using exclusively `std` components. Implements custom binary framing, bounded-channel
+//! backpressure, room-based routing, direct messaging, and poisoned-mutex recovery.
+
+use std::collections::{HashMap, HashSet};
+use std::fmt;
+use std::io::{self, BufRead, Read, Write};
+use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
+use std::sync::{Arc, Mutex};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
+
+// ============================================================================
+// PROTOCOL CONSTANTS & SPECIFICATIONS
+// ============================================================================
+
+/// Magic byte identifying our custom binary chat protocol ('B' = 0x42)
+pub const PROTOCOL_MAGIC: u8 = 0x42;
+
+/// Protocol version number
+pub const PROTOCOL_VERSION: u8 = 0x01;
+
+/// Fixed-size header length: Magic(1) + Version(1) + Opcode(1) + Length(4)
+pub const HEADER_SIZE: usize = 7;
+
+/// Maximum payload limit (64 KiB) to defend against memory exhaustion attacks
+pub const MAX_PAYLOAD_SIZE: usize = 65_536;
+
+/// Bounded capacity for per-client outbound queues (provides backpressure)
+pub const CLIENT_QUEUE_CAPACITY: usize = 128;
+
+/// Default room joined upon authentication
+pub const DEFAULT_ROOM: &str = "lobby";
+
+/// Default server listen interface
+pub const DEFAULT_BIND_ADDR: &str = "127.0.0.1:8080";
+
+// ============================================================================
+// ERROR CODES & DOMAIN TYPES
+// ============================================================================
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u16)]
+pub enum ProtocolErrorCode {
+    GenericError = 1000,
+    AuthenticationRequired = 1001,
+    AlreadyAuthenticated = 1002,
+    NicknameTaken = 1003,
+    InvalidNickname = 1004,
+    UserNotFound = 1005,
+    RoomNotFound = 1006,
+    MalformedPayload = 1007,
+    BackpressureDrop = 1008,
+    FrameTooLarge = 1009,
+    ProtocolViolation = 1010,
+}
+
+#[derive(Debug)]
+pub enum FrameError {
+    Io(io::Error),
+    InvalidMagic(u8),
+    UnsupportedVersion(u8),
+    InvalidOpcode(u8),
+    PayloadTooLarge(usize),
+    IncompleteHeader,
+    InvalidUtf8(std::str::Utf8Error),
+    ConnectionClosed,
+}
+
+impl fmt::Display for FrameError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            FrameError::Io(e) => write!(f, "I/O Error: {}", e),
+            FrameError::InvalidMagic(m) => write!(f, "Invalid protocol magic: 0x{:02X}", m),
+            FrameError::UnsupportedVersion(v) => write!(f, "Unsupported version: {}", v),
+            FrameError::InvalidOpcode(op) => write!(f, "Invalid opcode: 0x{:02X}", op),
+            FrameError::PayloadTooLarge(sz) => {
+                write!(f, "Payload size {} exceeds maximum allowed", sz)
+            }
+            FrameError::IncompleteHeader => write!(f, "Stream closed before full header was read"),
+            FrameError::InvalidUtf8(e) => write!(f, "Payload contains invalid UTF-8: {}", e),
+            FrameError::ConnectionClosed => write!(f, "Underlying connection closed"),
+        }
+    }
+}
+
+impl std::error::Error for FrameError {}
+
+impl From<io::Error> for FrameError {
+    fn from(err: io::Error) -> Self {
+        FrameError::Io(err)
+    }
+}
+
+impl From<std::str::Utf8Error> for FrameError {
+    fn from(err: std::str::Utf8Error) -> Self {
+        FrameError::InvalidUtf8(err)
+    }
+}
+
+// ============================================================================
+// PROTOCOL OPCODES & WIRE FRAMING
+// ============================================================================
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Opcode {
+    // Client-to-Server Opcodes (0x01 ..= 0x1F)
+    C2sLogin = 0x01,
+    C2sJoinRoom = 0x02,
+    C2sLeaveRoom = 0x03,
+    C2sRoomMsg = 0x04,
+    C2sDirectMsg = 0x05,
+    C2sWho = 0x06,
+    C2sListRooms = 0x07,
+    C2sPing = 0x08,
+    C2sQuit = 0x09,
+
+    // Server-to-Client Opcodes (0x80 ..= 0x9F)
+    S2cLoginAck = 0x80,
+    S2cNotice = 0x81,
+    S2cRoomBroadcast = 0x82,
+    S2cDirectDelivery = 0x83,
+    S2cWhoReply = 0x84,
+    S2cRoomsReply = 0x85,
+    S2cError = 0x86,
+    S2cPong = 0x87,
+}
+
+impl Opcode {
+    pub fn from_u8(b: u8) -> Result<Self, FrameError> {
+        match b {
+            0x01 => Ok(Opcode::C2sLogin),
+            0x02 => Ok(Opcode::C2sJoinRoom),
+            0x03 => Ok(Opcode::C2sLeaveRoom),
+            0x04 => Ok(Opcode::C2sRoomMsg),
+            0x05 => Ok(Opcode::C2sDirectMsg),
+            0x06 => Ok(Opcode::C2sWho),
+            0x07 => Ok(Opcode::C2sListRooms),
+            0x08 => Ok(Opcode::C2sPing),
+            0x09 => Ok(Opcode::C2sQuit),
+
+            0x80 => Ok(Opcode::S2cLoginAck),
+            0x81 => Ok(Opcode::S2cNotice),
+            0x82 => Ok(Opcode::S2cRoomBroadcast),
+            0x83 => Ok(Opcode::S2cDirectDelivery),
+            0x84 => Ok(Opcode::S2cWhoReply),
+            0x85 => Ok(Opcode::S2cRoomsReply),
+            0x86 => Ok(Opcode::S2cError),
+            0x87 => Ok(Opcode::S2cPong),
+            other => Err(FrameError::InvalidOpcode(other)),
+        }
+    }
+
+    pub fn to_u8(self) -> u8 {
+        self as u8
+    }
+}
+
+/// In-memory representation of a framed wire packet
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Frame {
+    pub opcode: Opcode,
+    pub payload: Vec<u8>,
+}
+
+impl Frame {
+    pub fn new(opcode: Opcode, payload: Vec<u8>) -> Self {
+        Self { opcode, payload }
+    }
+
+    pub fn from_utf8(opcode: Opcode, msg: &str) -> Self {
+        Self {
+            opcode,
+            payload: msg.as_bytes().to_vec(),
+        }
+    }
+
+    pub fn new_error(code: ProtocolErrorCode, message: &str) -> Self {
+        let code_num = code as u16;
+        let mut payload = Vec::with_capacity(2 + message.len());
+        payload.extend_from_slice(&code_num.to_be_bytes());
+        payload.extend_from_slice(message.as_bytes());
+        Self {
+            opcode: Opcode::S2cError,
+            payload,
+        }
+    }
+
+    /// Encodes the frame into a byte vector for wire transmission
+    pub fn serialize(&self) -> Vec<u8> {
+        let payload_len = self.payload.len() as u32;
+        let mut buffer = Vec::with_capacity(HEADER_SIZE + self.payload.len());
+        buffer.push(PROTOCOL_MAGIC);
+        buffer.push(PROTOCOL_VERSION);
+        buffer.push(self.opcode.to_u8());
+        buffer.extend_from_slice(&payload_len.to_be_bytes());
+        buffer.extend_from_slice(&self.payload);
+        buffer
+    }
+
+    /// Reads exactly one fully framed packet from any reader
+    pub fn read_from<R: Read>(reader: &mut R) -> Result<Self, FrameError> {
+        let mut header = [0u8; HEADER_SIZE];
+        match reader.read_exact(&mut header) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                return Err(FrameError::ConnectionClosed);
+            }
+            Err(e) => return Err(FrameError::Io(e)),
+        }
+
+        if header[0] != PROTOCOL_MAGIC {
+            return Err(FrameError::InvalidMagic(header[0]));
+        }
+
+        if header[1] != PROTOCOL_VERSION {
+            return Err(FrameError::UnsupportedVersion(header[1]));
+        }
+
+        let opcode = Opcode::from_u8(header[2])?;
+        let payload_len = u32::from_be_bytes([header[3], header[4], header[5], header[6]]) as usize;
+
+        if payload_len > MAX_PAYLOAD_SIZE {
+            return Err(FrameError::PayloadTooLarge(payload_len));
+        }
+
+        let mut payload = vec![0u8; payload_len];
+        if payload_len > 0 {
+            reader.read_exact(&mut payload)?;
+        }
+
+        Ok(Frame { opcode, payload })
+    }
+
+    /// Extracts payload as a UTF-8 string slice
+    pub fn payload_as_str(&self) -> Result<&str, FrameError> {
+        std::str::from_utf8(&self.payload).map_err(FrameError::InvalidUtf8)
+    }
+}
+
+// ============================================================================
+// SERVER DOMAIN MODEL & STATE ARCHITECTURE
+// ============================================================================
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ClientId(pub u64);
+
+impl fmt::Display for ClientId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "CID#{}", self.0)
+    }
+}
+
+pub struct ClientSession {
+    pub id: ClientId,
+    pub nickname: Option<String>,
+    pub current_room: Option<String>,
+    pub outbound_tx: SyncSender<Frame>,
+    pub peer_addr: SocketAddr,
+    pub connected_at: Instant,
+    pub dropped_frames: u64,
+}
+
+impl ClientSession {
+    /// Attempts non-blocking write to outbound queue. Implements active backpressure.
+    pub fn try_send_frame(&mut self, frame: Frame) -> Result<(), ProtocolErrorCode> {
+        match self.outbound_tx.try_send(frame) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(_)) => {
+                self.dropped_frames += 1;
+                eprintln!(
+                    "[BACKPRESSURE] Buffer saturated for {} ({}). Dropped frames: {}",
+                    self.id,
+                    self.nickname.as_deref().unwrap_or("unauthenticated"),
+                    self.dropped_frames
+                );
+                Err(ProtocolErrorCode::BackpressureDrop)
+            }
+            Err(TrySendError::Disconnected(_)) => Err(ProtocolErrorCode::GenericError),
+        }
+    }
+}
+
+pub struct ServerState {
+    pub clients: HashMap<ClientId, ClientSession>,
+    pub nick_to_id: HashMap<String, ClientId>,
+    pub rooms: HashMap<String, HashSet<ClientId>>,
+}
+
+impl ServerState {
+    pub fn new() -> Self {
+        let mut rooms = HashMap::new();
+        rooms.insert(DEFAULT_ROOM.to_string(), HashSet::new());
+
+        Self {
+            clients: HashMap::new(),
+            nick_to_id: HashMap::new(),
+            rooms,
+        }
+    }
+
+    /// Validates and sanitizes proposed usernames
+    pub fn is_valid_nickname(nick: &str) -> bool {
+        !nick.is_empty()
+            && nick.len() <= 24
+            && nick
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    }
+
+    /// Broadcasts a frame to all members of a room (optionally skipping the sender)
+    pub fn broadcast_to_room(
+        &mut self,
+        room_name: &str,
+        frame: Frame,
+        exclude: Option<ClientId>,
+    ) {
+        // Collect IDs first so the immutable borrow of `self.rooms` ends completely
+        let recipients: Vec<ClientId> = match self.rooms.get(room_name) {
+            Some(members) => members
+                .iter()
+                .copied()
+                .filter(|id| Some(*id) != exclude)
+                .collect(),
+            None => return,
+        };
+
+        for client_id in recipients {
+            if let Some(client) = self.clients.get_mut(&client_id) {
+                let _ = client.try_send_frame(frame.clone());
+            }
+        }
+    }
+}
+
+// ============================================================================
+// POISON-RESILIENT MUTEX WRAPPER
+// ============================================================================
+
+/// Thread-safe shared state wrapper capable of surviving worker thread panics.
+#[derive(Clone)]
+pub struct SafeSharedState {
+    inner: Arc<Mutex<ServerState>>,
+    next_id: Arc<AtomicU64>,
+}
+
+impl SafeSharedState {
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(ServerState::new())),
+            next_id: Arc::new(AtomicU64::new(1)),
+        }
+    }
+
+    pub fn generate_client_id(&self) -> ClientId {
+        ClientId(self.next_id.fetch_add(1, Ordering::Relaxed))
+    }
+
+    /// Recovers state access even if another thread panicked while holding the lock.
+    pub fn access<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&mut ServerState) -> R,
+    {
+        let mut guard = match self.inner.lock() {
+            Ok(g) => g,
+            Err(poisoned) => {
+                eprintln!("[CRITICAL] Mutex poisoned! Initiating automated recovery.");
+                poisoned.into_inner()
+            }
+        };
+        f(&mut guard)
+    }
+}
+
+// ============================================================================
+// SERVER COMMAND PROCESSOR / DISPATCHER
+// ============================================================================
+
+pub struct Dispatcher;
+
+impl Dispatcher {
+    pub fn handle_login(
+        state: &SafeSharedState,
+        client_id: ClientId,
+        requested_nick: &str,
+    ) -> Result<(), ProtocolErrorCode> {
+        let clean_nick = requested_nick.trim();
+
+        if !ServerState::is_valid_nickname(clean_nick) {
+            return Err(ProtocolErrorCode::InvalidNickname);
+        }
+
+        state.access(|s| {
+            if s.nick_to_id.contains_key(clean_nick) {
+                return Err(ProtocolErrorCode::NicknameTaken);
+            }
+
+            {
+                let client = s.clients.get_mut(&client_id).ok_or(ProtocolErrorCode::GenericError)?;
+                if client.nickname.is_some() {
+                    return Err(ProtocolErrorCode::AlreadyAuthenticated);
+                }
+
+                // Register identity
+                client.nickname = Some(clean_nick.to_string());
+                let ack_payload = format!("{}:{}", clean_nick, client_id.0);
+                let ack_frame = Frame::from_utf8(Opcode::S2cLoginAck, &ack_payload);
+                let _ = client.try_send_frame(ack_frame);
+            }
+
+            s.nick_to_id.insert(clean_nick.to_string(), client_id);
+
+            // Automatically join default room
+            Self::internal_join_room(s, client_id, DEFAULT_ROOM);
+
+            Ok(())
+        })
+    }
+
+    pub fn handle_join(
+        state: &SafeSharedState,
+        client_id: ClientId,
+        room_name: &str,
+    ) -> Result<(), ProtocolErrorCode> {
+        let room_clean = room_name.trim();
+        if room_clean.is_empty() || room_clean.len() > 32 {
+            return Err(ProtocolErrorCode::MalformedPayload);
+        }
+
+        state.access(|s| {
+            let is_auth = s
+                .clients
+                .get(&client_id)
+                .map(|c| c.nickname.is_some())
+                .unwrap_or(false);
+
+            if !is_auth {
+                return Err(ProtocolErrorCode::AuthenticationRequired);
+            }
+
+            Self::internal_join_room(s, client_id, room_clean);
+            Ok(())
+        })
+    }
+
+    fn internal_join_room(s: &mut ServerState, client_id: ClientId, target_room: &str) {
+        let client_nick = match s.clients.get(&client_id).and_then(|c| c.nickname.clone()) {
+            Some(n) => n,
+            None => return,
+        };
+
+        // 1. Depart old room if one is occupied
+        let old_room = s
+            .clients
+            .get_mut(&client_id)
+            .and_then(|c| c.current_room.take());
+
+        if let Some(old_room_name) = old_room {
+            if let Some(members) = s.rooms.get_mut(&old_room_name) {
+                members.remove(&client_id);
+            }
+            let departure_notice = format!("User '{}' has left {}", client_nick, old_room_name);
+            s.broadcast_to_room(
+                &old_room_name,
+                Frame::from_utf8(Opcode::S2cNotice, &departure_notice),
+                Some(client_id),
+            );
+        }
+
+        // 2. Insert into new room
+        s.rooms
+            .entry(target_room.to_string())
+            .or_insert_with(HashSet::new)
+            .insert(client_id);
+
+        if let Some(client) = s.clients.get_mut(&client_id) {
+            client.current_room = Some(target_room.to_string());
+            let confirmation = format!("Joined room '{}'", target_room);
+            let _ = client.try_send_frame(Frame::from_utf8(Opcode::S2cNotice, &confirmation));
+        }
+
+        // 3. Notify new room members
+        let arrival_notice = format!("User '{}' joined {}", client_nick, target_room);
+        s.broadcast_to_room(
+            target_room,
+            Frame::from_utf8(Opcode::S2cNotice, &arrival_notice),
+            Some(client_id),
+        );
+    }
+
+    pub fn handle_room_msg(
+        state: &SafeSharedState,
+        client_id: ClientId,
+        message: &str,
+    ) -> Result<(), ProtocolErrorCode> {
+        let msg_clean = message.trim();
+        if msg_clean.is_empty() {
+            return Ok(());
+        }
+
+        state.access(|s| {
+            let (nick, current_room) = {
+                let client = s.clients.get(&client_id).ok_or(ProtocolErrorCode::GenericError)?;
+                let nick = client.nickname.as_ref().ok_or(ProtocolErrorCode::AuthenticationRequired)?.clone();
+                let current_room = client.current_room.as_ref().ok_or(ProtocolErrorCode::RoomNotFound)?.clone();
+                (nick, current_room)
+            };
+
+            // Format: <room_name>\0<sender_nick>\0<message>
+            let mut payload = Vec::new();
+            payload.extend_from_slice(current_room.as_bytes());
+            payload.push(0x00);
+            payload.extend_from_slice(nick.as_bytes());
+            payload.push(0x00);
+            payload.extend_from_slice(msg_clean.as_bytes());
+
+            let broadcast_frame = Frame::new(Opcode::S2cRoomBroadcast, payload);
+            s.broadcast_to_room(&current_room, broadcast_frame, None);
+            Ok(())
+        })
+    }
+
+    pub fn handle_direct_msg(
+        state: &SafeSharedState,
+        client_id: ClientId,
+        raw_payload: &[u8],
+    ) -> Result<(), ProtocolErrorCode> {
+        let mut split_iter = raw_payload.splitn(2, |&b| b == 0x00);
+        let target_bytes = split_iter.next().ok_or(ProtocolErrorCode::MalformedPayload)?;
+        let msg_bytes = split_iter.next().ok_or(ProtocolErrorCode::MalformedPayload)?;
+
+        let target_nick = std::str::from_utf8(target_bytes)
+            .map_err(|_| ProtocolErrorCode::MalformedPayload)?;
+        let message = std::str::from_utf8(msg_bytes)
+            .map_err(|_| ProtocolErrorCode::MalformedPayload)?;
+
+        state.access(|s| {
+            let sender_nick = {
+                let sender = s.clients.get(&client_id).ok_or(ProtocolErrorCode::GenericError)?;
+                sender.nickname.as_ref().ok_or(ProtocolErrorCode::AuthenticationRequired)?.clone()
+            };
+
+            let target_id = *s.nick_to_id.get(target_nick).ok_or(ProtocolErrorCode::UserNotFound)?;
+
+            // Format: <sender_nick>\0<message>
+            let mut delivery_payload = Vec::new();
+            delivery_payload.extend_from_slice(sender_nick.as_bytes());
+            delivery_payload.push(0x00);
+            delivery_payload.extend_from_slice(message.as_bytes());
+
+            {
+                let target_client = s.clients.get_mut(&target_id).ok_or(ProtocolErrorCode::UserNotFound)?;
+                target_client.try_send_frame(Frame::new(Opcode::S2cDirectDelivery, delivery_payload))?;
+            }
+
+            // Delivery receipt to sender
+            if let Some(me) = s.clients.get_mut(&client_id) {
+                let receipt = format!("-> [{}] {}", target_nick, message);
+                let _ = me.try_send_frame(Frame::from_utf8(Opcode::S2cNotice, &receipt));
+            }
+
+            Ok(())
+        })
+    }
+
+    pub fn handle_who(
+        state: &SafeSharedState,
+        client_id: ClientId,
+        query_room: &str,
+    ) -> Result<(), ProtocolErrorCode> {
+        state.access(|s| {
+            let target_room = {
+                let client = s.clients.get(&client_id).ok_or(ProtocolErrorCode::GenericError)?;
+                if client.nickname.is_none() {
+                    return Err(ProtocolErrorCode::AuthenticationRequired);
+                }
+                if query_room.trim().is_empty() {
+                    client.current_room.as_deref().unwrap_or(DEFAULT_ROOM).to_string()
+                } else {
+                    query_room.trim().to_string()
+                }
+            };
+
+            let members_str = match s.rooms.get(&target_room) {
+                Some(members_ids) => {
+                    let mut names = Vec::new();
+                    for mid in members_ids {
+                        if let Some(c) = s.clients.get(mid) {
+                            if let Some(ref n) = c.nickname {
+                                names.push(n.clone());
+                            }
+                        }
+                    }
+                    names.sort();
+                    names.join(",")
+                }
+                None => return Err(ProtocolErrorCode::RoomNotFound),
+            };
+
+            // Format: <target_room>\0<nick1,nick2,nick3...>
+            let mut payload = Vec::new();
+            payload.extend_from_slice(target_room.as_bytes());
+            payload.push(0x00);
+            payload.extend_from_slice(members_str.as_bytes());
+
+            if let Some(me) = s.clients.get_mut(&client_id) {
+                let _ = me.try_send_frame(Frame::new(Opcode::S2cWhoReply, payload));
+            }
+
+            Ok(())
+        })
+    }
+
+    pub fn handle_list_rooms(
+        state: &SafeSharedState,
+        client_id: ClientId,
+    ) -> Result<(), ProtocolErrorCode> {
+        state.access(|s| {
+            let client = s.clients.get(&client_id).ok_or(ProtocolErrorCode::GenericError)?;
+            if client.nickname.is_none() {
+                return Err(ProtocolErrorCode::AuthenticationRequired);
+            }
+
+            let mut room_stats = Vec::new();
+            for (room, members) in &s.rooms {
+                room_stats.push(format!("{}:{}", room, members.len()));
+            }
+            room_stats.sort();
+            let payload_str = room_stats.join(",");
+
+            if let Some(me) = s.clients.get_mut(&client_id) {
+                let _ = me.try_send_frame(Frame::from_utf8(Opcode::S2cRoomsReply, &payload_str));
+            }
+
+            Ok(())
+        })
+    }
+
+    pub fn handle_disconnect(state: &SafeSharedState, client_id: ClientId) {
+        state.access(|s| {
+            if let Some(client) = s.clients.remove(&client_id) {
+                if let Some(ref nick) = client.nickname {
+                    s.nick_to_id.remove(nick);
+
+                    if let Some(ref room) = client.current_room {
+                        if let Some(members) = s.rooms.get_mut(room) {
+                            members.remove(&client_id);
+                        }
+                        let notice = format!("User '{}' disconnected", nick);
+                        s.broadcast_to_room(
+                            room,
+                            Frame::from_utf8(Opcode::S2cNotice, &notice),
+                            None,
+                        );
+                    }
+                }
+                println!("[SESSION] Cleaned up resources for client: {}", client_id);
+            }
+        });
+    }
+}
+
+// ============================================================================
+// WORKER THREAD LOOPS (READER & WRITER SUBSYSTEMS)
+// ============================================================================
+
+/// Writer thread loop: handles backpressure by polling the client's bounded channel
+fn spawn_client_writer(
+    mut stream: TcpStream,
+    receiver: Receiver<Frame>,
+    client_id: ClientId,
+) -> JoinHandle<()> {
+    thread::Builder::new()
+        .name(format!("writer-{}", client_id))
+        .spawn(move || {
+            while let Ok(frame) = receiver.recv() {
+                let bytes = frame.serialize();
+                if let Err(e) = stream.write_all(&bytes) {
+                    eprintln!("[TX-ERR] Write to {} aborted: {}", client_id, e);
+                    break;
+                }
+                if let Err(e) = stream.flush() {
+                    eprintln!("[TX-ERR] Flush to {} aborted: {}", client_id, e);
+                    break;
+                }
+            }
+            let _ = stream.shutdown(Shutdown::Both);
+        })
+        .expect("Failed to spawn writer thread")
+}
+
+/// Reader thread loop: extracts and validates binary frames, drives the state machine
+fn spawn_client_reader(
+    mut stream: TcpStream,
+    client_id: ClientId,
+    state: SafeSharedState,
+) -> JoinHandle<()> {
+    thread::Builder::new()
+        .name(format!("reader-{}", client_id))
+        .spawn(move || {
+            loop {
+                match Frame::read_from(&mut stream) {
+                    Ok(frame) => {
+                        let res = match frame.opcode {
+                            Opcode::C2sLogin => {
+                                match frame.payload_as_str() {
+                                    Ok(nick) => Dispatcher::handle_login(&state, client_id, nick),
+                                    Err(_) => Err(ProtocolErrorCode::MalformedPayload),
+                                }
+                            }
+                            Opcode::C2sJoinRoom => {
+                                match frame.payload_as_str() {
+                                    Ok(room) => Dispatcher::handle_join(&state, client_id, room),
+                                    Err(_) => Err(ProtocolErrorCode::MalformedPayload),
+                                }
+                            }
+                            Opcode::C2sLeaveRoom => {
+                                Dispatcher::handle_join(&state, client_id, DEFAULT_ROOM)
+                            }
+                            Opcode::C2sRoomMsg => {
+                                match frame.payload_as_str() {
+                                    Ok(text) => Dispatcher::handle_room_msg(&state, client_id, text),
+                                    Err(_) => Err(ProtocolErrorCode::MalformedPayload),
+                                }
+                            }
+                            Opcode::C2sDirectMsg => {
+                                Dispatcher::handle_direct_msg(&state, client_id, &frame.payload)
+                            }
+                            Opcode::C2sWho => {
+                                match frame.payload_as_str() {
+                                    Ok(room) => Dispatcher::handle_who(&state, client_id, room),
+                                    Err(_) => Err(ProtocolErrorCode::MalformedPayload),
+                                }
+                            }
+                            Opcode::C2sListRooms => {
+                                Dispatcher::handle_list_rooms(&state, client_id)
+                            }
+                            Opcode::C2sPing => {
+                                state.access(|s| {
+                                    if let Some(client) = s.clients.get_mut(&client_id) {
+                                        let pong = Frame::new(Opcode::S2cPong, frame.payload.clone());
+                                        let _ = client.try_send_frame(pong);
+                                    }
+                                });
+                                Ok(())
+                            }
+                            Opcode::C2sQuit => {
+                                println!("[SESSION] Clean quit requested by {}", client_id);
+                                break;
+                            }
+                            _ => Err(ProtocolErrorCode::ProtocolViolation),
+                        };
+
+                        if let Err(err_code) = res {
+                            state.access(|s| {
+                                if let Some(client) = s.clients.get_mut(&client_id) {
+                                    let err_frame = Frame::new_error(
+                                        err_code,
+                                        &format!("Operation failed with code: {:?}", err_code),
+                                    );
+                                    let _ = client.try_send_frame(err_frame);
+                                }
+                            });
+                        }
+                    }
+                    Err(FrameError::ConnectionClosed) => {
+                        println!("[SESSION] Connection closed cleanly by remote: {}", client_id);
+                        break;
+                    }
+                    Err(e) => {
+                        eprintln!("[RX-ERR] Connection breach on {}: {}", client_id, e);
+                        break;
+                    }
+                }
+            }
+
+            Dispatcher::handle_disconnect(&state, client_id);
+        })
+        .expect("Failed to spawn reader thread")
+}
+
+// ============================================================================
+// SERVER CORE SUPERVISOR
+// ============================================================================
+
+pub struct ChatServer {
+    bind_addr: String,
+    state: SafeSharedState,
+    running: Arc<AtomicBool>,
+}
+
+impl ChatServer {
+    pub fn new(bind_addr: &str) -> Self {
+        Self {
+            bind_addr: bind_addr.to_string(),
+            state: SafeSharedState::new(),
+            running: Arc::new(AtomicBool::new(true)),
+        }
+    }
+
+    pub fn run(&self) -> io::Result<()> {
+        let listener = TcpListener::bind(&self.bind_addr)?;
+        listener.set_nonblocking(false)?;
+
+        println!("============================================================");
+        println!("🚀 CHAT SERVER ONLINE AT {}", self.bind_addr);
+        println!("   Protocol Version: 0x{:02X}", PROTOCOL_VERSION);
+        println!("   Max Frame Size:   {} bytes", MAX_PAYLOAD_SIZE);
+        println!("   Queue Limit:      {} frames/client", CLIENT_QUEUE_CAPACITY);
+        println!("============================================================");
+
+        while self.running.load(Ordering::SeqCst) {
+            match listener.accept() {
+                Ok((stream, peer_addr)) => {
+                    if let Err(e) = stream.set_nodelay(true) {
+                        eprintln!("[NET] Warning: Failed to set TCP_NODELAY: {}", e);
+                    }
+                    let _ = stream.set_read_timeout(Some(Duration::from_secs(600)));
+                    let _ = stream.set_write_timeout(Some(Duration::from_secs(15)));
+
+                    let client_id = self.state.generate_client_id();
+                    println!("[ACCEPT] Inbound connection from {} assigned {}", peer_addr, client_id);
+
+                    let (outbound_tx, outbound_rx) = sync_channel::<Frame>(CLIENT_QUEUE_CAPACITY);
+
+                    let writer_stream = match stream.try_clone() {
+                        Ok(s) => s,
+                        Err(e) => {
+                            eprintln!("[FATAL] Stream clone failed: {}", e);
+                            continue;
+                        }
+                    };
+
+                    let session = ClientSession {
+                        id: client_id,
+                        nickname: None,
+                        current_room: None,
+                        outbound_tx,
+                        peer_addr,
+                        connected_at: Instant::now(),
+                        dropped_frames: 0,
+                    };
+
+                    self.state.access(|s| {
+                        s.clients.insert(client_id, session);
+                    });
+
+                    spawn_client_writer(writer_stream, outbound_rx, client_id);
+                    spawn_client_reader(stream, client_id, self.state.clone());
+                }
+                Err(e) => {
+                    eprintln!("[ACCEPT-ERR] Error accepting incoming stream: {}", e);
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
+// ============================================================================
+// INTEGRATED TEST CLIENT SUBSYSTEM
+// ============================================================================
+
+pub struct InteractiveClient;
+
+impl InteractiveClient {
+    pub fn run(server_addr: &str, nickname: &str) -> io::Result<()> {
+        println!("[CONNECTING] Opening TCP channel to {}...", server_addr);
+        let stream = TcpStream::connect(server_addr)?;
+        stream.set_nodelay(true)?;
+
+        let mut read_stream = stream.try_clone()?;
+        let mut write_stream = stream;
+
+        // Perform protocol handshake / Login
+        let login_frame = Frame::from_utf8(Opcode::C2sLogin, nickname);
+        write_stream.write_all(&login_frame.serialize())?;
+        write_stream.flush()?;
+
+        // Spawn Inbound Frame Dispatcher
+        let reader_handle = thread::spawn(move || {
+            loop {
+                match Frame::read_from(&mut read_stream) {
+                    Ok(frame) => match frame.opcode {
+                        Opcode::S2cLoginAck => {
+                            let text = frame.payload_as_str().unwrap_or("?");
+                            println!("\n✅ [AUTH SUCCESSFUL] Welcome! Session Details: {}", text);
+                        }
+                        Opcode::S2cNotice => {
+                            let text = frame.payload_as_str().unwrap_or("");
+                            println!("\n📢 [SYSTEM NOTICE] {}", text);
+                        }
+                        Opcode::S2cRoomBroadcast => {
+                            if let Ok(full) = frame.payload_as_str() {
+                                let parts: Vec<&str> = full.split('\0').collect();
+                                if parts.len() == 3 {
+                                    println!("\n💬 [{}] <{}> {}", parts[0], parts[1], parts[2]);
+                                }
+                            }
+                        }
+                        Opcode::S2cDirectDelivery => {
+                            if let Ok(full) = frame.payload_as_str() {
+                                let parts: Vec<&str> = full.split('\0').collect();
+                                if parts.len() == 2 {
+                                    println!("\n🔒 [WHISPER from {}] {}", parts[0], parts[1]);
+                                }
+                            }
+                        }
+                        Opcode::S2cWhoReply => {
+                            if let Ok(full) = frame.payload_as_str() {
+                                let parts: Vec<&str> = full.split('\0').collect();
+                                if parts.len() == 2 {
+                                    println!("\n👥 [OCCUPANTS OF '{}']: {}", parts[0], parts[1]);
+                                }
+                            }
+                        }
+                        Opcode::S2cRoomsReply => {
+                            let text = frame.payload_as_str().unwrap_or("");
+                            println!("\n🏠 [ACTIVE ROOM DIRECTORY]: {}", text);
+                        }
+                        Opcode::S2cError => {
+                            if frame.payload.len() >= 2 {
+                                let code = u16::from_be_bytes([frame.payload[0], frame.payload[1]]);
+                                let msg = std::str::from_utf8(&frame.payload[2..]).unwrap_or("Unknown");
+                                println!("\n❌ [SERVER ERROR #{}] {}", code, msg);
+                            }
+                        }
+                        Opcode::S2cPong => {
+                            println!("\n🏓 [PONG RECEIVED]");
+                        }
+                        _ => println!("\n❓ [UNKNOWN OPCODE] 0x{:02X}", frame.opcode.to_u8()),
+                    },
+                    Err(FrameError::ConnectionClosed) => {
+                        println!("\n🔌 Connection terminated by server.");
+                        std::process::exit(0);
+                    }
+                    Err(e) => {
+                        eprintln!("\n🚨 Protocol error: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+                print!("> ");
+                let _ = io::stdout().flush();
+            }
+        });
+
+        println!("------------------------------------------------------------");
+        println!("Type standard messages to talk in the room.");
+        println!("Available Commands:");
+        println!("  /join <room>       - Switch chat rooms");
+        println!("  /msg <user> <msg>  - Send private whisper");
+        println!("  /who [room]        - Query occupants");
+        println!("  /rooms             - List all active rooms");
+        println!("  /ping              - Heartbeat test");
+        println!("  /quit              - Disconnect");
+        println!("------------------------------------------------------------\n");
+
+        let stdin = io::stdin();
+        print!("> ");
+        let _ = io::stdout().flush();
+
+        for line_result in stdin.lock().lines() {
+            let line = match line_result {
+                Ok(l) => l,
+                Err(_) => break,
+            };
+
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                print!("> ");
+                let _ = io::stdout().flush();
+                continue;
+            }
+
+            let frame = if trimmed.starts_with('/') {
+                let mut parts = trimmed.splitn(3, ' ');
+                let cmd = parts.next().unwrap();
+
+                match cmd {
+                    "/join" => {
+                        let room = parts.next().unwrap_or(DEFAULT_ROOM);
+                        Some(Frame::from_utf8(Opcode::C2sJoinRoom, room))
+                    }
+                    "/msg" => {
+                        let to = parts.next();
+                        let text = parts.next();
+                        if let (Some(target), Some(body)) = (to, text) {
+                            let mut payload = Vec::new();
+                            payload.extend_from_slice(target.as_bytes());
+                            payload.push(0x00);
+                            payload.extend_from_slice(body.as_bytes());
+                            Some(Frame::new(Opcode::C2sDirectMsg, payload))
+                        } else {
+                            println!("Usage: /msg <nickname> <message>");
+                            None
+                        }
+                    }
+                    "/who" => {
+                        let target_room = parts.next().unwrap_or("");
+                        Some(Frame::from_utf8(Opcode::C2sWho, target_room))
+                    }
+                    "/rooms" => Some(Frame::new(Opcode::C2sListRooms, Vec::new())),
+                    "/ping" => Some(Frame::new(Opcode::C2sPing, vec![1, 2, 3, 4])),
+                    "/quit" => {
+                        let _ = write_stream.write_all(&Frame::new(Opcode::C2sQuit, Vec::new()).serialize());
+                        break;
+                    }
+                    _ => {
+                        println!("Unknown command: {}", cmd);
+                        None
+                    }
+                }
+            } else {
+                Some(Frame::from_utf8(Opcode::C2sRoomMsg, trimmed))
+            };
+
+            if let Some(f) = frame {
+                if let Err(e) = write_stream.write_all(&f.serialize()) {
+                    eprintln!("Failed to send frame: {}", e);
+                    break;
+                }
+                let _ = write_stream.flush();
+            }
+
+            print!("> ");
+            let _ = io::stdout().flush();
+        }
+
+        let _ = reader_handle.join();
+        Ok(())
+    }
+}
+
+// ============================================================================
+// SYSTEM ENTRYPOINT & CLI PARSER
+// ============================================================================
+
+fn main() -> io::Result<()> {
+    let args: Vec<String> = std::env::args().collect();
+
+    // Check if invoked as a client for end-to-end testing in RustRover
+    if args.len() >= 2 && (args[1] == "--client" || args[1] == "-c") {
+        let nickname = if args.len() >= 3 {
+            &args[2]
+        } else {
+            "GuestUser"
+        };
+        let addr = if args.len() >= 4 {
+            &args[3]
+        } else {
+            DEFAULT_BIND_ADDR
+        };
+
+        InteractiveClient::run(addr, nickname)?;
+        return Ok(());
+    }
+
+    // Default operation: Spin up the Multi-Threaded Engine
+    let bind_addr = if args.len() >= 2 {
+        &args[1]
+    } else {
+        DEFAULT_BIND_ADDR
+    };
+
+    let server = ChatServer::new(bind_addr);
+    server.run()
+}
