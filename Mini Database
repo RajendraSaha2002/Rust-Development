@@ -1,0 +1,1283 @@
+//! # BitForge Mini Database Engine
+//!
+//! An in-memory Key-Value store backed by an Append-Only Write-Ahead Log (WAL) on disk.
+//!
+//! Features:
+//! - Append-only Write-Ahead Log (WAL) with manual big-endian binary encoding (no external crates).
+//! - Custom CRC32 checksum calculation to detect torn writes and bit rot.
+//! - Crash-recovery replay engine with automatic detection and truncation of partial/corrupted writes.
+//! - Thread-safe in-memory index (`HashMap`) protected via reader-writer locks.
+//! - Online atomic background compaction (log rewriting with obsolete key collection).
+//! - Custom TCP binary wire protocol supporting GET, SET, DELETE, COMPACT, STATS, and PING.
+//! - Interactive REPL client, multi-threaded stress benchmark, and crash-recovery simulation suite.
+
+use std::collections::HashMap;
+use std::fmt;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::net::{TcpListener, TcpStream};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+// ============================================================================
+// 1. CHECKSUM UTILITY (IEEE 802.3 CRC32 - Zero External Crates)
+// ============================================================================
+
+/// Precomputed compile-time table for CRC32 (polynomial: 0xEDB88320).
+const fn generate_crc_table() -> [u32; 256] {
+    let mut table = [0u32; 256];
+    let mut i = 0;
+    while i < 256 {
+        let mut crc = i as u32;
+        let mut j = 0;
+        while j < 8 {
+            if (crc & 1) != 0 {
+                crc = (crc >> 1) ^ 0xEDB88320;
+            } else {
+                crc >>= 1;
+            }
+            j += 1;
+        }
+        table[i] = crc;
+        i += 1;
+    }
+    table
+}
+
+const CRC_TABLE: [u32; 256] = generate_crc_table();
+
+/// Calculates the IEEE 802.3 CRC32 checksum of a byte slice.
+pub fn calculate_crc32(bytes: &[u8]) -> u32 {
+    let mut crc = 0xFFFF_FFFFu32;
+    for &byte in bytes {
+        let table_index = ((crc ^ (byte as u32)) & 0xFF) as usize;
+        crc = (crc >> 8) ^ CRC_TABLE[table_index];
+    }
+    crc ^ 0xFFFF_FFFFu32
+}
+
+// ============================================================================
+// 2. ERROR TYPES
+// ============================================================================
+
+#[derive(Debug)]
+pub enum EngineError {
+    Io(io::Error),
+    InvalidMagic,
+    CrcMismatch { expected: u32, actual: u32 },
+    CorruptedRecord(String),
+    KeyNotFound,
+    ProtocolViolation(String),
+    CompactionInProgress,
+    Internal(String),
+}
+
+impl fmt::Display for EngineError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            EngineError::Io(e) => write!(f, "I/O Error: {}", e),
+            EngineError::InvalidMagic => write!(f, "Invalid WAL header magic bytes"),
+            EngineError::CrcMismatch { expected, actual } => {
+                write!(f, "CRC32 Checksum mismatch: expected 0x{:08X}, calculated 0x{:08X}", expected, actual)
+            }
+            EngineError::CorruptedRecord(msg) => write!(f, "Corrupted record: {}", msg),
+            EngineError::KeyNotFound => write!(f, "Key not found"),
+            EngineError::ProtocolViolation(msg) => write!(f, "Protocol violation: {}", msg),
+            EngineError::CompactionInProgress => write!(f, "Log compaction already in progress"),
+            EngineError::Internal(msg) => write!(f, "Internal error: {}", msg),
+        }
+    }
+}
+
+impl std::error::Error for EngineError {}
+
+impl From<io::Error> for EngineError {
+    fn from(err: io::Error) -> Self {
+        EngineError::Io(err)
+    }
+}
+
+pub type Result<T> = std::result::Result<T, EngineError>;
+
+// ============================================================================
+// 3. WRITE-AHEAD LOG (WAL) SPECIFICATION
+// ============================================================================
+
+/// Binary Layout of a Single WAL Record:
+/// +-----------------------+---------------------+
+/// | Field                 | Size / Format       |
+/// +-----------------------+---------------------+
+/// | MAGIC                 | 4 Bytes (0x57414C31)|
+/// | CHECKSUM (CRC32)      | 4 Bytes (Big-Endian)|
+/// | TIMESTAMP (Epoch ms)  | 8 Bytes (Big-Endian)|
+/// | OP_CODE               | 1 Byte  (1=SET, 2=DEL)
+/// | KEY_LEN (K)           | 4 Bytes (Big-Endian)|
+/// | KEY_PAYLOAD           | K Bytes             |
+/// | VAL_LEN (V)           | 4 Bytes (Big-Endian)|
+/// | VAL_PAYLOAD           | V Bytes (0 if DEL)  |
+/// +-----------------------+---------------------+
+
+const WAL_MAGIC: [u8; 4] = [0x57, 0x41, 0x4C, 0x31]; // "WAL1"
+const OP_SET: u8 = 0x01;
+const OP_DELETE: u8 = 0x02;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncPolicy {
+    /// Issue an fsync / flush to hardware on every single mutation (Highest durability, lowest throughput).
+    Always,
+    /// Issue an fsync every N mutations.
+    EveryN(u64),
+    /// Leave syncing up to the OS page cache daemon (Maximum throughput, vulnerable to power loss).
+    Never,
+}
+
+#[derive(Debug, Clone)]
+pub enum WalOperation {
+    Set { key: Vec<u8>, value: Vec<u8> },
+    Delete { key: Vec<u8> },
+}
+
+#[derive(Debug, Clone)]
+pub struct WalEntry {
+    pub timestamp: u64,
+    pub op: WalOperation,
+}
+
+impl WalEntry {
+    /// Serializes entry payload and computes CRC32.
+    fn serialize(&self) -> Vec<u8> {
+        let (op_code, key, value) = match &self.op {
+            WalOperation::Set { key, value } => (OP_SET, key.as_slice(), value.as_slice()),
+            WalOperation::Delete { key } => (OP_DELETE, key.as_slice(), &[][..]),
+        };
+
+        let mut payload = Vec::with_capacity(8 + 1 + 4 + key.len() + 4 + value.len());
+        payload.extend_from_slice(&self.timestamp.to_be_bytes());
+        payload.push(op_code);
+        payload.extend_from_slice(&(key.len() as u32).to_be_bytes());
+        payload.extend_from_slice(key);
+        payload.extend_from_slice(&(value.len() as u32).to_be_bytes());
+        payload.extend_from_slice(value);
+
+        let crc = calculate_crc32(&payload);
+
+        let mut record = Vec::with_capacity(4 + 4 + payload.len());
+        record.extend_from_slice(&WAL_MAGIC);
+        record.extend_from_slice(&crc.to_be_bytes());
+        record.extend_from_slice(&payload);
+        record
+    }
+}
+
+// ============================================================================
+// 4. WAL FILE READER AND CRASH RECOVERY
+// ============================================================================
+
+pub struct WalRecoveryResult {
+    pub memtable: HashMap<Vec<u8>, Vec<u8>>,
+    pub total_records: u64,
+    pub bytes_replayed: u64,
+    pub truncated_bytes: u64,
+}
+
+pub struct WalManager;
+
+impl WalManager {
+    /// Replays the WAL file from disk. If a torn write (partial bytes or invalid checksum)
+    /// is detected at the tail of the log, the file is automatically truncated back to
+    /// the last atomically verified byte offset.
+    pub fn replay_and_repair<P: AsRef<Path>>(path: P) -> Result<WalRecoveryResult> {
+        let path = path.as_ref();
+        if !path.exists() {
+            return Ok(WalRecoveryResult {
+                memtable: HashMap::new(),
+                total_records: 0,
+                bytes_replayed: 0,
+                truncated_bytes: 0,
+            });
+        }
+
+        let mut file = OpenOptions::new().read(true).write(true).open(path)?;
+        let file_len = file.metadata()?.len();
+        let mut memtable = HashMap::new();
+
+        let mut last_valid_offset = 0u64;
+        let mut total_records = 0u64;
+
+        let mut buffer = [0u8; 8192];
+        let mut cursor = 0u64;
+
+        println!("[RECOVERY] Scanning log file '{}' ({} bytes)...", path.display(), file_len);
+
+        'recovery_loop: loop {
+            file.seek(SeekFrom::Start(cursor))?;
+
+            // 1. Read Magic Header (4 bytes)
+            let mut magic = [0u8; 4];
+            match file.read_exact(&mut magic) {
+                Ok(_) => {
+                    if magic != WAL_MAGIC {
+                        eprintln!("[RECOVERY] Bad magic at offset {}: expected {:?}, got {:?}", cursor, WAL_MAGIC, magic);
+                        break 'recovery_loop;
+                    }
+                }
+                Err(ref e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                    // Normal EOF at boundary
+                    break 'recovery_loop;
+                }
+                Err(e) => return Err(EngineError::Io(e)),
+            }
+
+            // 2. Read CRC32 (4 bytes)
+            let mut crc_buf = [0u8; 4];
+            if let Err(_) = file.read_exact(&mut crc_buf) {
+                eprintln!("[RECOVERY] Incomplete record header at offset {}", cursor);
+                break 'recovery_loop;
+            }
+            let expected_crc = u32::from_be_bytes(crc_buf);
+
+            // 3. Read Timestamp (8 bytes)
+            let mut ts_buf = [0u8; 8];
+            if let Err(_) = file.read_exact(&mut ts_buf) {
+                break 'recovery_loop;
+            }
+            let _timestamp = u64::from_be_bytes(ts_buf);
+
+            // 4. Read Op Code (1 byte)
+            let mut op_buf = [0u8; 1];
+            if let Err(_) = file.read_exact(&mut op_buf) {
+                break 'recovery_loop;
+            }
+            let op_code = op_buf[0];
+
+            // 5. Read Key Length (4 bytes)
+            let mut key_len_buf = [0u8; 4];
+            if let Err(_) = file.read_exact(&mut key_len_buf) {
+                break 'recovery_loop;
+            }
+            let key_len = u32::from_be_bytes(key_len_buf) as usize;
+
+            // 6. Read Key payload
+            let mut key = vec![0u8; key_len];
+            if let Err(_) = file.read_exact(&mut key) {
+                break 'recovery_loop;
+            }
+
+            // 7. Read Value Length (4 bytes)
+            let mut val_len_buf = [0u8; 4];
+            if let Err(_) = file.read_exact(&mut val_len_buf) {
+                break 'recovery_loop;
+            }
+            let val_len = u32::from_be_bytes(val_len_buf) as usize;
+
+            // 8. Read Value payload
+            let mut val = vec![0u8; val_len];
+            if let Err(_) = file.read_exact(&mut val) {
+                break 'recovery_loop;
+            }
+
+            // 9. Recompute and verify Checksum
+            let mut payload = Vec::with_capacity(8 + 1 + 4 + key_len + 4 + val_len);
+            payload.extend_from_slice(&ts_buf);
+            payload.push(op_code);
+            payload.extend_from_slice(&key_len_buf);
+            payload.extend_from_slice(&key);
+            payload.extend_from_slice(&val_len_buf);
+            payload.extend_from_slice(&val);
+
+            let calculated_crc = calculate_crc32(&payload);
+            if calculated_crc != expected_crc {
+                eprintln!(
+                    "[RECOVERY] CRC mismatch at offset {}: expected 0x{:08X}, found 0x{:08X}",
+                    cursor, expected_crc, calculated_crc
+                );
+                break 'recovery_loop;
+            }
+
+            // 10. Record is pristine. Apply to state.
+            match op_code {
+                OP_SET => {
+                    memtable.insert(key, val);
+                }
+                OP_DELETE => {
+                    memtable.remove(&key);
+                }
+                _ => {
+                    eprintln!("[RECOVERY] Unknown op code {} at offset {}", op_code, cursor);
+                    break 'recovery_loop;
+                }
+            }
+
+            total_records += 1;
+            cursor = file.stream_position()?;
+            last_valid_offset = cursor;
+        }
+
+        let truncated_bytes = if last_valid_offset < file_len {
+            let diff = file_len - last_valid_offset;
+            println!(
+                "[CRASH RECOVERY] Torn write detected! Truncating {} invalid tail bytes (file size {} -> {})",
+                diff, file_len, last_valid_offset
+            );
+            file.set_len(last_valid_offset)?;
+            file.sync_all()?;
+            diff
+        } else {
+            0
+        };
+
+        println!(
+            "[RECOVERY COMPLETE] Loaded {} live keys from {} WAL records. (Bytes replayed: {}, Truncated: {})",
+            memtable.len(),
+            total_records,
+            last_valid_offset,
+            truncated_bytes
+        );
+
+        Ok(WalRecoveryResult {
+            memtable,
+            total_records,
+            bytes_replayed: last_valid_offset,
+            truncated_bytes,
+        })
+    }
+}
+
+// ============================================================================
+// 5. ENGINE CORE & COMPACTION SUBSYSTEM
+// ============================================================================
+
+pub struct EngineConfig {
+    pub wal_path: PathBuf,
+    pub sync_policy: SyncPolicy,
+    pub auto_compact_threshold_bytes: u64,
+}
+
+pub struct EngineStats {
+    pub gets: AtomicU64,
+    pub sets: AtomicU64,
+    pub deletes: AtomicU64,
+    pub compactions: AtomicU64,
+    pub bytes_written: AtomicU64,
+}
+
+impl EngineStats {
+    pub fn new() -> Self {
+        Self {
+            gets: AtomicU64::new(0),
+            sets: AtomicU64::new(0),
+            deletes: AtomicU64::new(0),
+            compactions: AtomicU64::new(0),
+            bytes_written: AtomicU64::new(0),
+        }
+    }
+}
+
+struct EngineInner {
+    memtable: HashMap<Vec<u8>, Vec<u8>>,
+    wal_file: BufWriter<File>,
+    wal_size: u64,
+    unflushed_ops: u64,
+}
+
+pub struct Engine {
+    inner: Arc<RwLock<EngineInner>>,
+    config: EngineConfig,
+    pub stats: Arc<EngineStats>,
+    is_compacting: Arc<AtomicBool>,
+}
+
+impl Engine {
+    /// Opens the engine at the designated path, executing crash recovery first.
+    pub fn open(config: EngineConfig) -> Result<Self> {
+        if let Some(parent) = config.wal_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        let recovery = WalManager::replay_and_repair(&config.wal_path)?;
+
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .append(true)
+            .open(&config.wal_path)?;
+
+        let wal_size = file.metadata()?.len();
+
+        let inner = EngineInner {
+            memtable: recovery.memtable,
+            wal_file: BufWriter::new(file),
+            wal_size,
+            unflushed_ops: 0,
+        };
+
+        Ok(Self {
+            inner: Arc::new(RwLock::new(inner)),
+            config,
+            stats: Arc::new(EngineStats::new()),
+            is_compacting: Arc::new(AtomicBool::new(false)),
+        })
+    }
+
+    /// Reads a key from the in-memory cache.
+    pub fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
+        self.stats.gets.fetch_add(1, Ordering::Relaxed);
+        let guard = self.inner.read().expect("Lock poisoned");
+        guard.memtable.get(key).cloned()
+    }
+
+    /// Writes a Key/Value pair to disk log first, then updates memory.
+    pub fn set(&self, key: Vec<u8>, value: Vec<u8>) -> Result<()> {
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
+        let entry = WalEntry {
+            timestamp: ts,
+            op: WalOperation::Set {
+                key: key.clone(),
+                value: value.clone(),
+            },
+        };
+
+        let serialized = entry.serialize();
+
+        {
+            let mut guard = self.inner.write().expect("Lock poisoned");
+            guard.wal_file.write_all(&serialized)?;
+            guard.wal_size += serialized.len() as u64;
+            guard.unflushed_ops += 1;
+
+            self.handle_sync_policy(&mut guard)?;
+            guard.memtable.insert(key, value);
+        }
+
+        self.stats.sets.fetch_add(1, Ordering::Relaxed);
+        self.stats.bytes_written.fetch_add(serialized.len() as u64, Ordering::Relaxed);
+
+        self.check_auto_compaction();
+        Ok(())
+    }
+
+    /// Appends a delete tombstone to the log, then purges the key from memory.
+    pub fn delete(&self, key: Vec<u8>) -> Result<bool> {
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
+        let entry = WalEntry {
+            timestamp: ts,
+            op: WalOperation::Delete { key: key.clone() },
+        };
+
+        let serialized = entry.serialize();
+
+        let existed = {
+            let mut guard = self.inner.write().expect("Lock poisoned");
+            guard.wal_file.write_all(&serialized)?;
+            guard.wal_size += serialized.len() as u64;
+            guard.unflushed_ops += 1;
+
+            self.handle_sync_policy(&mut guard)?;
+            guard.memtable.remove(&key).is_some()
+        };
+
+        self.stats.deletes.fetch_add(1, Ordering::Relaxed);
+        self.stats.bytes_written.fetch_add(serialized.len() as u64, Ordering::Relaxed);
+
+        self.check_auto_compaction();
+        Ok(existed)
+    }
+
+    fn handle_sync_policy(&self, inner: &mut EngineInner) -> Result<()> {
+        match self.config.sync_policy {
+            SyncPolicy::Always => {
+                inner.wal_file.flush()?;
+                inner.wal_file.get_ref().sync_all()?;
+                inner.unflushed_ops = 0;
+            }
+            SyncPolicy::EveryN(n) => {
+                if inner.unflushed_ops >= n {
+                    inner.wal_file.flush()?;
+                    inner.wal_file.get_ref().sync_data()?;
+                    inner.unflushed_ops = 0;
+                }
+            }
+            SyncPolicy::Never => {
+                // Rely on regular OS buffer flush
+            }
+        }
+        Ok(())
+    }
+
+    fn check_auto_compaction(&self) {
+        if self.config.auto_compact_threshold_bytes == 0 {
+            return;
+        }
+
+        let current_size = {
+            let guard = self.inner.read().expect("Lock poisoned");
+            guard.wal_size
+        };
+
+        if current_size >= self.config.auto_compact_threshold_bytes {
+            let this = self.clone_handle();
+            thread::spawn(move || {
+                if let Err(e) = this.compact() {
+                    eprintln!("[BACKGROUND COMPACTION ERROR] {}", e);
+                }
+            });
+        }
+    }
+
+    /// Rewrites the entire log into a temporary file, dropping all stale keys and
+    /// deleted tombstones, followed by an atomic filesystem rename.
+    pub fn compact(&self) -> Result<()> {
+        if self.is_compacting.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+            return Err(EngineError::CompactionInProgress);
+        }
+
+        let start_time = Instant::now();
+        println!("[COMPACTION] Starting online compaction...");
+
+        let temp_compact_path = self.config.wal_path.with_extension("compact.tmp");
+
+        // 1. Snapshot the keys to be preserved
+        let snapshot: Vec<(Vec<u8>, Vec<u8>)> = {
+            let guard = self.inner.read().expect("Lock poisoned");
+            guard.memtable.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+        };
+
+        // 2. Stream snapshot to a fresh temporary WAL file
+        {
+            let temp_file = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&temp_compact_path)?;
+
+            let mut writer = BufWriter::new(temp_file);
+            let ts = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+
+            for (k, v) in snapshot {
+                let entry = WalEntry {
+                    timestamp: ts,
+                    op: WalOperation::Set { key: k, value: v },
+                };
+                let serialized = entry.serialize();
+                writer.write_all(&serialized)?;
+            }
+
+            writer.flush()?;
+            writer.get_ref().sync_all()?;
+        }
+
+        // 3. Atomically replace the old WAL file with the compacted one
+        {
+            let mut guard = self.inner.write().expect("Lock poisoned");
+            guard.wal_file.flush()?;
+
+            fs::rename(&temp_compact_path, &self.config.wal_path)?;
+
+            let new_file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .append(true)
+                .open(&self.config.wal_path)?;
+
+            guard.wal_size = new_file.metadata()?.len();
+            guard.wal_file = BufWriter::new(new_file);
+            guard.unflushed_ops = 0;
+        }
+
+        self.is_compacting.store(false, Ordering::SeqCst);
+        self.stats.compactions.fetch_add(1, Ordering::Relaxed);
+
+        println!(
+            "[COMPACTION COMPLETE] Finished in {:.2?}. New WAL size: {} bytes",
+            start_time.elapsed(),
+            self.inner.read().unwrap().wal_size
+        );
+
+        Ok(())
+    }
+
+    /// Spawns a background thread that triggers compaction at regular intervals.
+    pub fn start_periodic_compaction(self: &Arc<Self>, interval: Duration) {
+        let engine_clone = Arc::clone(self);
+        thread::spawn(move || loop {
+            thread::sleep(interval);
+            if let Err(e) = engine_clone.compact() {
+                if !matches!(e, EngineError::CompactionInProgress) {
+                    eprintln!("[PERIODIC COMPACTOR] Error: {}", e);
+                }
+            }
+        });
+    }
+
+    pub fn clone_handle(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+            config: EngineConfig {
+                wal_path: self.config.wal_path.clone(),
+                sync_policy: self.config.sync_policy,
+                auto_compact_threshold_bytes: self.config.auto_compact_threshold_bytes,
+            },
+            stats: Arc::clone(&self.stats),
+            is_compacting: Arc::clone(&self.is_compacting),
+        }
+    }
+
+    pub fn key_count(&self) -> usize {
+        self.inner.read().unwrap().memtable.len()
+    }
+}
+
+// ============================================================================
+// 6. CUSTOM TCP BINARY PROTOCOL
+// ============================================================================
+
+/// Wire Protocol Definition:
+///
+/// Client Request:
+/// +-------------+-------------+--------------+--------------+-------------+-------------+
+/// | MAGIC (2B)  | OP_CODE(1B) | KEY_LEN (4B) | VAL_LEN (4B) | KEY_BYTES   | VAL_BYTES   |
+/// | 0xCA 0xFE   | 0x01..0x06  | Big-Endian   | Big-Endian   | (Variable)  | (Variable)  |
+/// +-------------+-------------+--------------+--------------+-------------+-------------+
+///
+/// Server Response:
+/// +-------------+--------------+-----------------------------+
+/// | STATUS (1B) | PAY_LEN (4B) | PAYLOAD BYTES               |
+/// | 0x00=OK ... | Big-Endian   | (Variable, e.g. val, stats) |
+/// +-------------+--------------+-----------------------------+
+
+const PROTO_MAGIC: [u8; 2] = [0xCA, 0xFE];
+
+const CMD_PING: u8 = 0x01;
+const CMD_GET: u8 = 0x02;
+const CMD_SET: u8 = 0x03;
+const CMD_DELETE: u8 = 0x04;
+const CMD_COMPACT: u8 = 0x05;
+const CMD_STATS: u8 = 0x06;
+
+const STATUS_OK: u8 = 0x00;
+const STATUS_NOT_FOUND: u8 = 0x01;
+const STATUS_ERR: u8 = 0x02;
+
+pub struct ProtocolCodec;
+
+impl ProtocolCodec {
+    pub fn read_request<R: Read>(reader: &mut R) -> Result<(u8, Vec<u8>, Vec<u8>)> {
+        let mut magic = [0u8; 2];
+        if let Err(e) = reader.read_exact(&mut magic) {
+            return Err(EngineError::Io(e));
+        }
+
+        if magic != PROTO_MAGIC {
+            return Err(EngineError::ProtocolViolation(format!(
+                "Invalid protocol magic: {:?}",
+                magic
+            )));
+        }
+
+        let mut op_buf = [0u8; 1];
+        reader.read_exact(&mut op_buf)?;
+        let op_code = op_buf[0];
+
+        let mut key_len_buf = [0u8; 4];
+        reader.read_exact(&mut key_len_buf)?;
+        let key_len = u32::from_be_bytes(key_len_buf) as usize;
+
+        let mut val_len_buf = [0u8; 4];
+        reader.read_exact(&mut val_len_buf)?;
+        let val_len = u32::from_be_bytes(val_len_buf) as usize;
+
+        let mut key = vec![0u8; key_len];
+        reader.read_exact(&mut key)?;
+
+        let mut value = vec![0u8; val_len];
+        reader.read_exact(&mut value)?;
+
+        Ok((op_code, key, value))
+    }
+
+    pub fn write_response<W: Write>(writer: &mut W, status: u8, payload: &[u8]) -> Result<()> {
+        writer.write_all(&[status])?;
+        writer.write_all(&(payload.len() as u32).to_be_bytes())?;
+        writer.write_all(payload)?;
+        writer.flush()?;
+        Ok(())
+    }
+
+    pub fn send_request<W: Write>(
+        writer: &mut W,
+        op_code: u8,
+        key: &[u8],
+        val: &[u8],
+    ) -> Result<()> {
+        writer.write_all(&PROTO_MAGIC)?;
+        writer.write_all(&[op_code])?;
+        writer.write_all(&(key.len() as u32).to_be_bytes())?;
+        writer.write_all(&(val.len() as u32).to_be_bytes())?;
+        writer.write_all(key)?;
+        writer.write_all(val)?;
+        writer.flush()?;
+        Ok(())
+    }
+
+    pub fn read_response<R: Read>(reader: &mut R) -> Result<(u8, Vec<u8>)> {
+        let mut status_buf = [0u8; 1];
+        reader.read_exact(&mut status_buf)?;
+
+        let mut len_buf = [0u8; 4];
+        reader.read_exact(&mut len_buf)?;
+        let len = u32::from_be_bytes(len_buf) as usize;
+
+        let mut payload = vec![0u8; len];
+        reader.read_exact(&mut payload)?;
+
+        Ok((status_buf[0], payload))
+    }
+}
+
+// ============================================================================
+// 7. MULTITHREADED TCP SERVER
+// ============================================================================
+
+pub struct DatabaseServer {
+    engine: Arc<Engine>,
+    bind_addr: String,
+    shutdown_signal: Arc<AtomicBool>,
+}
+
+impl DatabaseServer {
+    pub fn new(engine: Arc<Engine>, bind_addr: String) -> Self {
+        Self {
+            engine,
+            bind_addr,
+            shutdown_signal: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    pub fn listen_and_serve(&self) -> Result<()> {
+        let listener = TcpListener::bind(&self.bind_addr)?;
+        listener.set_nonblocking(true)?;
+
+        println!("[SERVER] Database server listening on {}", self.bind_addr);
+        println!("[SERVER] Ready to accept binary connections...");
+
+        while !self.shutdown_signal.load(Ordering::Relaxed) {
+            match listener.accept() {
+                Ok((stream, client_addr)) => {
+                    let engine = Arc::clone(&self.engine);
+                    thread::spawn(move || {
+                        if let Err(e) = Self::handle_connection(stream, engine) {
+                            // Connection termination or stream closure
+                            let _ = e;
+                        }
+                    });
+                }
+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(e) => return Err(EngineError::Io(e)),
+            }
+        }
+        Ok(())
+    }
+
+    fn handle_connection(stream: TcpStream, engine: Arc<Engine>) -> Result<()> {
+        stream.set_nodelay(true)?;
+        let mut reader = BufReader::new(stream.try_clone()?);
+        let mut writer = BufWriter::new(stream);
+
+        loop {
+            let (op, key, val) = match ProtocolCodec::read_request(&mut reader) {
+                Ok(req) => req,
+                Err(EngineError::Io(ref e)) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                    break;
+                }
+                Err(e) => return Err(e),
+            };
+
+            match op {
+                CMD_PING => {
+                    ProtocolCodec::write_response(&mut writer, STATUS_OK, b"PONG")?;
+                }
+                CMD_GET => {
+                    if let Some(found_val) = engine.get(&key) {
+                        ProtocolCodec::write_response(&mut writer, STATUS_OK, &found_val)?;
+                    } else {
+                        ProtocolCodec::write_response(&mut writer, STATUS_NOT_FOUND, b"Key not found")?;
+                    }
+                }
+                CMD_SET => match engine.set(key, val) {
+                    Ok(_) => {
+                        ProtocolCodec::write_response(&mut writer, STATUS_OK, b"OK")?;
+                    }
+                    Err(e) => {
+                        let err_str = e.to_string();
+                        ProtocolCodec::write_response(&mut writer, STATUS_ERR, err_str.as_bytes())?;
+                    }
+                },
+                CMD_DELETE => match engine.delete(key) {
+                    Ok(true) => {
+                        ProtocolCodec::write_response(&mut writer, STATUS_OK, b"DELETED")?;
+                    }
+                    Ok(false) => {
+                        ProtocolCodec::write_response(&mut writer, STATUS_NOT_FOUND, b"Key not found")?;
+                    }
+                    Err(e) => {
+                        let err_str = e.to_string();
+                        ProtocolCodec::write_response(&mut writer, STATUS_ERR, err_str.as_bytes())?;
+                    }
+                },
+                CMD_COMPACT => match engine.compact() {
+                    Ok(_) => {
+                        ProtocolCodec::write_response(&mut writer, STATUS_OK, b"COMPACT_OK")?;
+                    }
+                    Err(e) => {
+                        let err_str = e.to_string();
+                        ProtocolCodec::write_response(&mut writer, STATUS_ERR, err_str.as_bytes())?;
+                    }
+                },
+                CMD_STATS => {
+                    let stats_str = format!(
+                        "keys: {}\ngets: {}\nsets: {}\ndeletes: {}\ncompactions: {}\nbytes_written: {}",
+                        engine.key_count(),
+                        engine.stats.gets.load(Ordering::Relaxed),
+                        engine.stats.sets.load(Ordering::Relaxed),
+                        engine.stats.deletes.load(Ordering::Relaxed),
+                        engine.stats.compactions.load(Ordering::Relaxed),
+                        engine.stats.bytes_written.load(Ordering::Relaxed),
+                    );
+                    ProtocolCodec::write_response(&mut writer, STATUS_OK, stats_str.as_bytes())?;
+                }
+                _ => {
+                    ProtocolCodec::write_response(
+                        &mut writer,
+                        STATUS_ERR,
+                        b"Unknown command opcode",
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+// ============================================================================
+// 8. DATABASE CLIENT (REPL & BENCHMARK DRIVER)
+// ============================================================================
+
+pub struct DatabaseClient {
+    stream: TcpStream,
+}
+
+impl DatabaseClient {
+    pub fn connect(addr: &str) -> Result<Self> {
+        let stream = TcpStream::connect(addr)?;
+        stream.set_nodelay(true)?;
+        Ok(Self { stream })
+    }
+
+    pub fn ping(&mut self) -> Result<String> {
+        ProtocolCodec::send_request(&mut self.stream, CMD_PING, &[], &[])?;
+        let (status, payload) = ProtocolCodec::read_response(&mut self.stream)?;
+        Self::format_response(status, payload)
+    }
+
+    pub fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        ProtocolCodec::send_request(&mut self.stream, CMD_GET, key, &[])?;
+        let (status, payload) = ProtocolCodec::read_response(&mut self.stream)?;
+        if status == STATUS_OK {
+            Ok(Some(payload))
+        } else if status == STATUS_NOT_FOUND {
+            Ok(None)
+        } else {
+            Err(EngineError::Internal(String::from_utf8_lossy(&payload).to_string()))
+        }
+    }
+
+    pub fn set(&mut self, key: &[u8], val: &[u8]) -> Result<()> {
+        ProtocolCodec::send_request(&mut self.stream, CMD_SET, key, val)?;
+        let (status, payload) = ProtocolCodec::read_response(&mut self.stream)?;
+        if status == STATUS_OK {
+            Ok(())
+        } else {
+            Err(EngineError::Internal(String::from_utf8_lossy(&payload).to_string()))
+        }
+    }
+
+    pub fn delete(&mut self, key: &[u8]) -> Result<bool> {
+        ProtocolCodec::send_request(&mut self.stream, CMD_DELETE, key, &[])?;
+        let (status, payload) = ProtocolCodec::read_response(&mut self.stream)?;
+        if status == STATUS_OK {
+            Ok(true)
+        } else if status == STATUS_NOT_FOUND {
+            Ok(false)
+        } else {
+            Err(EngineError::Internal(String::from_utf8_lossy(&payload).to_string()))
+        }
+    }
+
+    pub fn compact(&mut self) -> Result<String> {
+        ProtocolCodec::send_request(&mut self.stream, CMD_COMPACT, &[], &[])?;
+        let (status, payload) = ProtocolCodec::read_response(&mut self.stream)?;
+        Self::format_response(status, payload)
+    }
+
+    pub fn stats(&mut self) -> Result<String> {
+        ProtocolCodec::send_request(&mut self.stream, CMD_STATS, &[], &[])?;
+        let (status, payload) = ProtocolCodec::read_response(&mut self.stream)?;
+        Self::format_response(status, payload)
+    }
+
+    fn format_response(status: u8, payload: Vec<u8>) -> Result<String> {
+        let text = String::from_utf8_lossy(&payload).to_string();
+        if status == STATUS_OK {
+            Ok(text)
+        } else {
+            Err(EngineError::Internal(text))
+        }
+    }
+}
+
+// ============================================================================
+// 9. HIGH-PERFORMANCE BENCHMARK HARNESS
+// ============================================================================
+
+pub fn run_benchmark(server_addr: &str, thread_count: usize, ops_per_thread: usize) {
+    println!("\n=== Starting Engine Load Benchmark ===");
+    println!("Target: {}", server_addr);
+    println!("Threads: {}", thread_count);
+    println!("Ops/Thread: {}", ops_per_thread);
+    println!("Total Operations: {}", thread_count * ops_per_thread);
+
+    let start = Instant::now();
+    let mut handles = Vec::new();
+
+    for t_idx in 0..thread_count {
+        let addr = server_addr.to_string();
+        let handle = thread::spawn(move || {
+            let mut client = DatabaseClient::connect(&addr).expect("Benchmark client failed to connect");
+            for i in 0..ops_per_thread {
+                let key_str = format!("bench_key_{}_{}", t_idx, i);
+                let val_str = format!("bench_val_data_payload_string_{}", i);
+
+                // 1. SET
+                client.set(key_str.as_bytes(), val_str.as_bytes()).unwrap();
+
+                // 2. GET
+                let v = client.get(key_str.as_bytes()).unwrap().expect("Key should exist");
+                assert_eq!(v, val_str.as_bytes());
+
+                // 3. DELETE (every 4th key to exercise log tombstoning)
+                if i % 4 == 0 {
+                    client.delete(key_str.as_bytes()).unwrap();
+                }
+            }
+        });
+        handles.push(handle);
+    }
+
+    for h in handles {
+        h.join().unwrap();
+    }
+
+    let elapsed = start.elapsed();
+    let total_ops = (thread_count * ops_per_thread * 2) + (thread_count * (ops_per_thread / 4));
+    let ops_per_sec = (total_ops as f64) / elapsed.as_secs_f64();
+
+    println!("=== Benchmark Completed ===");
+    println!("Duration: {:.2?}", elapsed);
+    println!("Throughput: {:.2} operations/sec\n", ops_per_sec);
+}
+
+// ============================================================================
+// 10. CRASH RECOVERY AND TORN-WRITE SIMULATION
+// ============================================================================
+
+pub fn run_crash_recovery_test() {
+    let test_dir = PathBuf::from("./target/crash_test_db");
+    let wal_path = test_dir.join("test.wal");
+
+    if test_dir.exists() {
+        let _ = fs::remove_dir_all(&test_dir);
+    }
+    fs::create_dir_all(&test_dir).unwrap();
+
+    println!("\n========================================================");
+    println!("   RUNNING AUTOMATED CRASH RECOVERY TEST SUITE          ");
+    println!("========================================================");
+
+    // Step 1: Open fresh engine and insert good records
+    {
+        println!("[STEP 1] Initializing engine and inserting 1,000 valid records...");
+        let config = EngineConfig {
+            wal_path: wal_path.clone(),
+            sync_policy: SyncPolicy::Always,
+            auto_compact_threshold_bytes: 0,
+        };
+        let engine = Engine::open(config).expect("Failed to initialize engine");
+
+        for i in 0..1000 {
+            let k = format!("user:{}", i);
+            let v = format!("profile_payload_record_{}", i);
+            engine.set(k.into_bytes(), v.into_bytes()).unwrap();
+        }
+
+        assert_eq!(engine.key_count(), 1000);
+        println!("[STEP 1 OK] Engine shut down safely.");
+    }
+
+    // Step 2: Inject a severe torn-write mid-record at the tail
+    {
+        println!("[STEP 2] Simulating a mid-flight kill / power outage (torn write)...");
+        let mut file = OpenOptions::new()
+            .write(true)
+            .append(true)
+            .open(&wal_path)
+            .unwrap();
+
+        // Write a partial header: Magic + partial CRC bytes, followed by abrupt termination
+        file.write_all(&WAL_MAGIC).unwrap();
+        file.write_all(&[0xDE, 0xAD]).unwrap(); // Truncated CRC
+        file.flush().unwrap();
+        file.sync_all().unwrap();
+
+        let torn_len = file.metadata().unwrap().len();
+        println!("[STEP 2 OK] Corrupted file written. File size on disk: {} bytes", torn_len);
+    }
+
+    // Step 3: Restart engine and verify auto-repair
+    {
+        println!("[STEP 3] Booting up database engine on corrupted file...");
+        let config = EngineConfig {
+            wal_path: wal_path.clone(),
+            sync_policy: SyncPolicy::Always,
+            auto_compact_threshold_bytes: 0,
+        };
+
+        let engine = Engine::open(config).expect("Engine recovery failed!");
+
+        println!("[STEP 3] Verifying recovered memory state...");
+        assert_eq!(engine.key_count(), 1000, "Recovery must restore exact 1000 keys!");
+
+        for i in 0..1000 {
+            let k = format!("user:{}", i);
+            let expected_v = format!("profile_payload_record_{}", i);
+            let val = engine.get(k.as_bytes()).expect("Key missing after recovery");
+            assert_eq!(val, expected_v.as_bytes());
+        }
+
+        println!("[STEP 3 OK] All 1,000 keys verified perfectly intact!");
+
+        // Step 4: Verify the log can still be written to following repair
+        println!("[STEP 4] Verifying engine continues normal writes after recovery...");
+        engine
+            .set(b"recovery_test_key".to_vec(), b"survived_the_crash".to_vec())
+            .unwrap();
+        assert_eq!(
+            engine.get(b"recovery_test_key").unwrap(),
+            b"survived_the_crash"
+        );
+        println!("[STEP 4 OK] Engine wrote and retrieved new key without issues.");
+    }
+
+    println!("========================================================");
+    println!("   CRASH RECOVERY TEST PASSED: ENGINE INTEGRITY 100%   ");
+    println!("========================================================\n");
+
+    let _ = fs::remove_dir_all(&test_dir);
+}
+
+// ============================================================================
+// 11. REPL CLIENT INTERFACE
+// ============================================================================
+
+pub fn start_repl(server_addr: &str) {
+    println!("Connecting to BitForge Database at {}...", server_addr);
+    let mut client = match DatabaseClient::connect(server_addr) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Connection failed: {}", e);
+            return;
+        }
+    };
+
+    println!("Connected! Type 'HELP' for available commands or 'EXIT' to quit.\n");
+    let stdin = io::stdin();
+
+    loop {
+        print!("bitforge> ");
+        io::stdout().flush().unwrap();
+
+        let mut input = String::new();
+        if stdin.read_line(&mut input).is_err() {
+            break;
+        }
+
+        let trimmed = input.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let parts: Vec<&str> = trimmed.split_whitespace().collect();
+        let cmd = parts[0].to_uppercase();
+
+        match cmd.as_str() {
+            "EXIT" | "QUIT" => {
+                println!("Goodbye!");
+                break;
+            }
+            "PING" => match client.ping() {
+                Ok(res) => println!("{}", res),
+                Err(e) => eprintln!("Error: {}", e),
+            },
+            "GET" => {
+                if parts.len() < 2 {
+                    println!("Usage: GET <key>");
+                    continue;
+                }
+                match client.get(parts[1].as_bytes()) {
+                    Ok(Some(val)) => println!("\"{}\"", String::from_utf8_lossy(&val)),
+                    Ok(None) => println!("(nil)"),
+                    Err(e) => eprintln!("Error: {}", e),
+                }
+            }
+            "SET" => {
+                if parts.len() < 3 {
+                    println!("Usage: SET <key> <value>");
+                    continue;
+                }
+                // Allow spaces inside value parameter
+                let val_start = trimmed.find(parts[1]).unwrap() + parts[1].len();
+                let value = trimmed[val_start..].trim();
+                match client.set(parts[1].as_bytes(), value.as_bytes()) {
+                    Ok(_) => println!("OK"),
+                    Err(e) => eprintln!("Error: {}", e),
+                }
+            }
+            "DEL" | "DELETE" => {
+                if parts.len() < 2 {
+                    println!("Usage: DEL <key>");
+                    continue;
+                }
+                match client.delete(parts[1].as_bytes()) {
+                    Ok(true) => println!("(integer) 1"),
+                    Ok(false) => println!("(integer) 0"),
+                    Err(e) => eprintln!("Error: {}", e),
+                }
+            }
+            "COMPACT" => match client.compact() {
+                Ok(res) => println!("Compact result: {}", res),
+                Err(e) => eprintln!("Error: {}", e),
+            },
+            "STATS" => match client.stats() {
+                Ok(res) => println!("{}", res),
+                Err(e) => eprintln!("Error: {}", e),
+            },
+            "HELP" => {
+                println!("Commands:");
+                println!("  PING                      Test connection");
+                println!("  GET <key>                 Retrieve value for key");
+                println!("  SET <key> <value>         Store key-value pair");
+                println!("  DEL <key>                 Delete key");
+                println!("  COMPACT                   Trigger log compaction");
+                println!("  STATS                     Display engine statistics");
+                println!("  EXIT                      Quit REPL");
+            }
+            _ => {
+                println!("Unknown command: '{}'. Type HELP for usage.", parts[0]);
+            }
+        }
+    }
+}
+
+// ============================================================================
+// 12. ENTRY POINT & CLI DISPATCHER
+// ============================================================================
+
+fn print_usage() {
+    println!("BitForge Mini Key-Value Storage Engine");
+    println!("Usage:");
+    println!("  bitforge server [bind_addr] [wal_path]   Start TCP database server");
+    println!("  bitforge client [server_addr]            Start interactive terminal REPL");
+    println!("  bitforge bench [server_addr]             Run concurrent stress benchmark");
+    println!("  bitforge test-crash                      Run crash-recovery and torn-write test");
+    println!("");
+    println!("Examples:");
+    println!("  bitforge server 127.0.0.1:6379 ./data/db.wal");
+    println!("  bitforge client 127.0.0.1:6379");
+    println!("  bitforge bench 127.0.0.1:6379");
+    println!("  bitforge test-crash");
+}
+
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+
+    if args.len() < 2 {
+        print_usage();
+        return;
+    }
+
+    match args[1].as_str() {
+        "server" => {
+            let bind_addr = args.get(2).cloned().unwrap_or_else(|| "127.0.0.1:6379".into());
+            let wal_path = args.get(3).cloned().unwrap_or_else(|| "./data/engine.wal".into());
+
+            println!("========================================================");
+            println!("  Starting BitForge In-Memory Storage Engine");
+            println!("========================================================");
+            println!("WAL Log File: {}", wal_path);
+            println!("Sync Policy : Every 100 writes + periodic fsync");
+            println!("Compaction  : Auto trigger at 64MB & background timer");
+
+            let config = EngineConfig {
+                wal_path: PathBuf::from(wal_path),
+                sync_policy: SyncPolicy::EveryN(100),
+                auto_compact_threshold_bytes: 64 * 1024 * 1024, // 64 MB
+            };
+
+            let engine = match Engine::open(config) {
+                Ok(eng) => Arc::new(eng),
+                Err(e) => {
+                    eprintln!("Fatal error opening database engine: {}", e);
+                    std::process::exit(1);
+                }
+            };
+
+            // Start periodic compaction worker every 60 seconds
+            engine.start_periodic_compaction(Duration::from_secs(60));
+
+            let server = DatabaseServer::new(engine, bind_addr);
+            if let Err(e) = server.listen_and_serve() {
+                eprintln!("Server shutdown error: {}", e);
+            }
+        }
+        "client" => {
+            let server_addr = args.get(2).cloned().unwrap_or_else(|| "127.0.0.1:6379".into());
+            start_repl(&server_addr);
+        }
+        "bench" => {
+            let server_addr = args.get(2).cloned().unwrap_or_else(|| "127.0.0.1:6379".into());
+            run_benchmark(&server_addr, 8, 10_000);
+        }
+        "test-crash" => {
+            run_crash_recovery_test();
+        }
+        _ => {
+            print_usage();
+        }
+    }
+}
