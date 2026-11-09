@@ -1,0 +1,1040 @@
+
+
+use std::cmp::min;
+use std::collections::BTreeMap;
+use std::fmt;
+use std::io::{Read, Write};
+use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
+
+// ============================================================================
+// CONSTANTS & CATALOGS
+// ============================================================================
+
+const DEFAULT_TIMEOUT_MS: u64 = 1200;
+const DEFAULT_BANNER_TIMEOUT_MS: u64 = 1500;
+const DEFAULT_THREAD_COUNT: usize = 50;
+const DEFAULT_DELAY_MS: u64 = 0;
+const MAX_BANNER_SIZE: usize = 1024;
+
+/// Top 100 most commonly scanned TCP ports in network reconnaissance.
+const TOP_100_PORTS: &[u16] = &[
+    7, 9, 13, 21, 22, 23, 25, 26, 37, 53, 79, 80, 81, 88, 106, 110, 111, 113, 119, 135,
+    139, 143, 144, 179, 199, 389, 427, 443, 444, 445, 465, 513, 514, 515, 543, 544, 548,
+    554, 587, 631, 646, 873, 990, 993, 995, 1025, 1026, 1027, 1028, 1029, 1110, 1433,
+    1720, 1723, 1755, 1900, 2000, 2001, 2049, 2121, 2717, 3000, 3128, 3306, 3389, 3986,
+    4899, 5000, 5009, 5051, 5060, 5101, 5190, 5357, 5432, 5631, 5666, 5800, 5900, 6000,
+    6001, 6646, 7070, 8000, 8008, 8009, 8080, 8081, 8443, 8888, 9100, 9999, 10000, 32768,
+    49152, 49153, 49154, 49155, 49156, 49157,
+];
+
+// ============================================================================
+// DATA MODELS & STRUCTS
+// ============================================================================
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PortState {
+    Open,
+    Closed,
+    Filtered,
+}
+
+impl fmt::Display for PortState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PortState::Open => write!(f, "OPEN"),
+            PortState::Closed => write!(f, "CLOSED"),
+            PortState::Filtered => write!(f, "FILTERED"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputFormat {
+    Table,
+    Json,
+    Csv,
+}
+
+#[derive(Debug, Clone)]
+pub struct ScanResult {
+    pub port: u16,
+    pub state: PortState,
+    pub latency: Duration,
+    pub banner: Option<String>,
+    pub service_name: String,
+    pub fingerprint: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ScanConfig {
+    pub target: String,
+    pub target_ip: IpAddr,
+    pub ports: Vec<u16>,
+    pub concurrency: usize,
+    pub timeout: Duration,
+    pub banner_timeout: Duration,
+    pub grab_banners: bool,
+    pub active_probing: bool,
+    pub output_format: OutputFormat,
+    pub output_file: Option<String>,
+    pub delay_ms: u64,
+    pub verbose: bool,
+}
+
+// ============================================================================
+// CUSTOM THREAD POOL IMPLEMENTATION
+// ============================================================================
+
+type Job = Box<dyn FnOnce() + Send + 'static>;
+
+enum Message {
+    NewJob(Job),
+    Terminate,
+}
+
+struct Worker {
+    id: usize,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl Worker {
+    fn new(id: usize, receiver: Arc<Mutex<mpsc::Receiver<Message>>>) -> Self {
+        let thread = thread::spawn(move || loop {
+            let message = {
+                let lock = receiver.lock().expect("Poisoned worker mutex lock");
+                lock.recv()
+            };
+
+            match message {
+                Ok(Message::NewJob(job)) => {
+                    job();
+                }
+                Ok(Message::Terminate) | Err(_) => {
+                    break;
+                }
+            }
+        });
+
+        Worker {
+            id,
+            thread: Some(thread),
+        }
+    }
+}
+
+pub struct ThreadPool {
+    workers: Vec<Worker>,
+    sender: Option<mpsc::Sender<Message>>,
+}
+
+impl ThreadPool {
+    pub fn new(size: usize) -> Self {
+        assert!(size > 0, "ThreadPool size must be greater than zero");
+
+        let (sender, receiver) = mpsc::channel();
+        let receiver = Arc::new(Mutex::new(receiver));
+        let mut workers = Vec::with_capacity(size);
+
+        for id in 0..size {
+            workers.push(Worker::new(id, Arc::clone(&receiver)));
+        }
+
+        ThreadPool {
+            workers,
+            sender: Some(sender),
+        }
+    }
+
+    pub fn execute<F>(&self, f: F)
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        let job = Box::new(f);
+        if let Some(ref sender) = self.sender {
+            sender.send(Message::NewJob(job)).expect("Failed to post job to ThreadPool queue");
+        }
+    }
+}
+
+impl Drop for ThreadPool {
+    fn drop(&mut self) {
+        if let Some(sender) = self.sender.take() {
+            for _ in &self.workers {
+                let _ = sender.send(Message::Terminate);
+            }
+        }
+
+        for worker in &mut self.workers {
+            if let Some(thread) = worker.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+}
+
+// ============================================================================
+// SERVICE FINGERPRINTING CATALOG
+// ============================================================================
+
+pub struct Fingerprinter;
+
+impl Fingerprinter {
+    /// Maps a well-known port to its default service name.
+    pub fn lookup_port_name(port: u16) -> &'static str {
+        match port {
+            20 => "ftp-data",
+            21 => "ftp",
+            22 => "ssh",
+            23 => "telnet",
+            25 => "smtp",
+            43 => "whois",
+            53 => "domain (dns)",
+            67 => "bootps",
+            68 => "bootpc",
+            69 => "tftp",
+            79 => "finger",
+            80 => "http",
+            88 => "kerberos",
+            110 => "pop3",
+            111 => "rpcbind",
+            119 => "nntp",
+            123 => "ntp",
+            135 => "msrpc",
+            137 => "netbios-ns",
+            138 => "netbios-dgm",
+            139 => "netbios-ssn",
+            143 => "imap",
+            161 => "snmp",
+            162 => "snmptrap",
+            179 => "bgp",
+            194 => "irc",
+            389 => "ldap",
+            443 => "https",
+            445 => "microsoft-ds",
+            465 => "smtps",
+            514 => "syslog",
+            515 => "printer (lpd)",
+            587 => "submission",
+            631 => "ipp",
+            636 => "ldaps",
+            873 => "rsync",
+            990 => "ftps",
+            993 => "imaps",
+            995 => "pop3s",
+            1080 => "socks",
+            1433 => "ms-sql-s",
+            1521 => "oracle",
+            1723 => "pptp",
+            2049 => "nfs",
+            2121 => "ccproxy-ftp",
+            3306 => "mysql",
+            3389 => "ms-wbt-server (rdp)",
+            5432 => "postgresql",
+            5672 => "amqp",
+            5900 => "vnc",
+            6379 => "redis",
+            6667 => "irc",
+            8000 => "http-alt",
+            8080 => "http-proxy",
+            8443 => "https-alt",
+            8888 => "http-alt",
+            9000 => "cslistener",
+            9092 => "kafka",
+            9200 => "elasticsearch",
+            11211 => "memcached",
+            27017 => "mongodb",
+            _ => "unknown",
+        }
+    }
+
+    /// Evaluates raw banner bytes and heuristics to fingerprint services.
+    pub fn identify(port: u16, banner: Option<&str>) -> (String, String) {
+        let base_service = Self::lookup_port_name(port).to_string();
+
+        let banner_str = match banner {
+            Some(b) if !b.trim().is_empty() => b,
+            _ => return (base_service, "No banner available".to_string()),
+        };
+
+        let upper = banner_str.to_uppercase();
+
+        // 1. SSH Fingerprint matching
+        if banner_str.starts_with("SSH-") {
+            let details = banner_str.lines().next().unwrap_or(banner_str).trim();
+            return ("ssh".to_string(), format!("SSH Protocol ({})", details));
+        }
+
+        // 2. HTTP Server matching
+        if upper.contains("HTTP/1.") || upper.contains("HTTP/2.") || upper.contains("<HTML") {
+            let server_name = banner_str
+                .lines()
+                .find(|l| l.to_lowercase().starts_with("server:"))
+                .map(|l| l[7..].trim())
+                .unwrap_or("Generic Web Server");
+
+            return ("http".to_string(), format!("HTTP Server ({})", server_name));
+        }
+
+        // 3. FTP Server matching
+        if banner_str.starts_with("220") && (upper.contains("FTP") || upper.contains("FILEZILLA")) {
+            let first_line = banner_str.lines().next().unwrap_or(banner_str).trim();
+            return ("ftp".to_string(), format!("FTP Service ({})", first_line));
+        }
+
+        // 4. SMTP Server matching
+        if banner_str.starts_with("220") && (upper.contains("SMTP") || upper.contains("POSTFIX") || upper.contains("MAIL")) {
+            let first_line = banner_str.lines().next().unwrap_or(banner_str).trim();
+            return ("smtp".to_string(), format!("SMTP Mail Transfer ({})", first_line));
+        }
+
+        // 5. Redis matching
+        if banner_str.starts_with("-ERR") || banner_str.starts_with("+PONG") || upper.contains("REDIS") {
+            return ("redis".to_string(), "Redis Key-Value Store".to_string());
+        }
+
+        // 6. MySQL matching
+        if banner_str.contains("mysql_native_password") || banner_str.contains("mariadb") {
+            return ("mysql".to_string(), "MySQL/MariaDB Database Handshake".to_string());
+        }
+
+        // 7. VNC matching
+        if banner_str.starts_with("RFB ") {
+            let version = banner_str.trim();
+            return ("vnc".to_string(), format!("VNC Protocol ({})", version));
+        }
+
+        (base_service, "Generic Service (heuristic match)".to_string())
+    }
+}
+
+// ============================================================================
+// PROBING & BANNER GRABBING ENGINE
+// ============================================================================
+
+pub struct BannerGrabber;
+
+impl BannerGrabber {
+    /// Sanitizes raw network bytes into clean, displayable ASCII strings.
+    pub fn sanitize_bytes(buffer: &[u8]) -> String {
+        let mut clean = String::with_capacity(buffer.len());
+        for &byte in buffer {
+            match byte {
+                b'\r' => (),
+                b'\n' => clean.push('\n'),
+                b'\t' => clean.push('\t'),
+                0x20..=0x7E => clean.push(byte as char),
+                _ => clean.push('.'),
+            }
+        }
+        clean.trim().to_string()
+    }
+
+    /// Attempts to read greeting banners; if silent, pushes specific protocol probes.
+    pub fn capture(stream: &mut TcpStream, port: u16, timeout: Duration, active_probing: bool) -> Option<String> {
+        let _ = stream.set_read_timeout(Some(timeout));
+        let _ = stream.set_write_timeout(Some(timeout));
+
+        let mut buffer = [0u8; MAX_BANNER_SIZE];
+
+        // Phase 1: Passive Listen (Services like SSH, FTP, SMTP speak first)
+        if let Ok(bytes_read) = stream.read(&mut buffer) {
+            if bytes_read > 0 {
+                return Some(Self::sanitize_bytes(&buffer[..bytes_read]));
+            }
+        }
+
+        if !active_probing {
+            return None;
+        }
+
+        // Phase 2: Active Targeted Probing
+        let probe_payload: &[u8] = match port {
+            80 | 8080 | 8000 | 8888 => b"HEAD / HTTP/1.0\r\nUser-Agent: NetRecon/1.0\r\n\r\n",
+            443 | 8443 => {
+                // TLS Client Hello minimal prefix
+                b"\x16\x03\x01\x00\x7a\x01\x00\x00\x76\x03\x03"
+            }
+            21 => b"HELP\r\n",
+            25 | 587 => b"EHLO netrecon.local\r\n",
+            110 => b"CAPA\r\n",
+            143 => b"A001 CAPABILITY\r\n",
+            6379 => b"PING\r\n",
+            _ => b"\r\n\r\n\r\n",
+        };
+
+        if stream.write_all(probe_payload).is_ok() {
+            let _ = stream.flush();
+            if let Ok(bytes_read) = stream.read(&mut buffer) {
+                if bytes_read > 0 {
+                    return Some(Self::sanitize_bytes(&buffer[..bytes_read]));
+                }
+            }
+        }
+
+        None
+    }
+}
+
+// ============================================================================
+// SCANNER ENGINE
+// ============================================================================
+
+pub struct Scanner;
+
+impl Scanner {
+    /// Executes a single TCP Connect timeout scan against the socket address.
+    pub fn scan_port(
+        target_ip: IpAddr,
+        port: u16,
+        timeout: Duration,
+        banner_timeout: Duration,
+        grab_banners: bool,
+        active_probing: bool,
+    ) -> ScanResult {
+        let socket_addr = SocketAddr::new(target_ip, port);
+        let start_time = Instant::now();
+
+        match TcpStream::connect_timeout(&socket_addr, timeout) {
+            Ok(mut stream) => {
+                let latency = start_time.elapsed();
+                let mut banner = None;
+
+                if grab_banners {
+                    banner = BannerGrabber::capture(&mut stream, port, banner_timeout, active_probing);
+                }
+
+                let (service_name, fingerprint) =
+                    Fingerprinter::identify(port, banner.as_deref());
+
+                ScanResult {
+                    port,
+                    state: PortState::Open,
+                    latency,
+                    banner,
+                    service_name,
+                    fingerprint,
+                }
+            }
+            Err(ref e) => {
+                let state = match e.kind() {
+                    std::io::ErrorKind::ConnectionRefused => PortState::Closed,
+                    std::io::ErrorKind::TimedOut => PortState::Filtered,
+                    _ => PortState::Filtered,
+                };
+
+                let service_name = Fingerprinter::lookup_port_name(port).to_string();
+
+                ScanResult {
+                    port,
+                    state,
+                    latency: start_time.elapsed(),
+                    banner: None,
+                    service_name,
+                    fingerprint: String::new(),
+                }
+            }
+        }
+    }
+}
+
+// ============================================================================
+// REPORTING & SERIALIZATION (ZERO EXTERNAL DEPENDENCY)
+// ============================================================================
+
+pub struct Reporter;
+
+impl Reporter {
+    pub fn print_banner(config: &ScanConfig) {
+        println!("===============================================================================");
+        println!("              NET-RECON: CONCURRENT NETWORK RECONNAISSANCE TOOL               ");
+        println!("===============================================================================");
+        println!(" Target Address       : {} ({})", config.target, config.target_ip);
+        println!(" Total Ports Queued   : {}", config.ports.len());
+        println!(" Concurrency Cap      : {} worker threads", config.concurrency);
+        println!(" Connect Timeout      : {:?}", config.timeout);
+        println!(" Banner Timeout       : {:?}", config.banner_timeout);
+        println!(" Inter-Packet Delay   : {} ms", config.delay_ms);
+        println!(" Banner Grabbing      : {}", if config.grab_banners { "ENABLED" } else { "DISABLED" });
+        println!(" Active Probing       : {}", if config.active_probing { "ENABLED" } else { "DISABLED" });
+        println!(" Output Formatting    : {:?}", config.output_format);
+        println!("===============================================================================");
+    }
+
+    pub fn format_table(results: &[ScanResult], total_duration: Duration) -> String {
+        let mut out = String::new();
+        out.push_str("\n+-------+--------+-----------------+-----------------------+------------------------------------------+\n");
+        out.push_str("| PORT  | STATE  | SERVICE         | LATENCY (ms)          | FINGERPRINT / BANNER PREVIEW             |\n");
+        out.push_str("+-------+--------+-----------------+-----------------------+------------------------------------------+\n");
+
+        for res in results.iter().filter(|r| r.state == PortState::Open) {
+            let banner_preview = if let Some(ref b) = res.banner {
+                let first_line = b.lines().next().unwrap_or("").trim();
+                if first_line.chars().count() > 40 {
+                    let truncated: String = first_line.chars().take(37).collect();
+                    format!("{}...", truncated)
+                } else {
+                    first_line.to_string()
+                }
+            } else if !res.fingerprint.is_empty() {
+                if res.fingerprint.chars().count() > 40 {
+                    let truncated: String = res.fingerprint.chars().take(37).collect();
+                    format!("{}...", truncated)
+                } else {
+                    res.fingerprint.clone()
+                }
+            } else {
+                "-".to_string()
+            };
+
+            let service_field = if res.service_name.chars().count() > 15 {
+                let truncated: String = res.service_name.chars().take(12).collect();
+                format!("{}...", truncated)
+            } else {
+                res.service_name.clone()
+            };
+
+            let latency_str = format!("{:.2}", res.latency.as_secs_f64() * 1000.0);
+
+            out.push_str(&format!(
+                "| {:<5} | {:<6} | {:<15} | {:<21} | {:<40} |\n",
+                res.port,
+                res.state.to_string(),
+                service_field,
+                latency_str,
+                banner_preview
+            ));
+        }
+
+        out.push_str("+-------+--------+-----------------+-----------------------+------------------------------------------+\n");
+        out.push_str(&format!("Scan completed in: {:.2?}\n", total_duration));
+        out
+    }
+
+    pub fn format_csv(results: &[ScanResult]) -> String {
+        let mut out = String::new();
+        out.push_str("port,state,service,latency_ms,fingerprint,banner\n");
+
+        for r in results.iter().filter(|r| r.state == PortState::Open) {
+            let clean_banner = r
+                .banner
+                .as_deref()
+                .unwrap_or("")
+                .replace('"', "\"\"")
+                .replace('\n', " ");
+
+            let clean_fp = r.fingerprint.replace('"', "\"\"");
+
+            out.push_str(&format!(
+                "{},\"{}\",\"{}\",{:.3},\"{}\",\"{}\"\n",
+                r.port,
+                r.state,
+                r.service_name,
+                r.latency.as_secs_f64() * 1000.0,
+                clean_fp,
+                clean_banner
+            ));
+        }
+        out
+    }
+
+    /// Compliant JSON serialization written entirely without Serde.
+    pub fn format_json(results: &[ScanResult], target: &str, target_ip: IpAddr, duration: Duration) -> String {
+        let mut out = String::new();
+        out.push_str("{\n");
+        out.push_str(&format!("  \"target\": \"{}\",\n", Self::escape_json(target)));
+        out.push_str(&format!("  \"ip\": \"{}\",\n", target_ip));
+        out.push_str(&format!("  \"duration_ms\": {},\n", duration.as_millis()));
+        out.push_str("  \"open_ports\": [\n");
+
+        let open_results: Vec<&ScanResult> = results.iter().filter(|r| r.state == PortState::Open).collect();
+
+        for (idx, r) in open_results.iter().enumerate() {
+            out.push_str("    {\n");
+            out.push_str(&format!("      \"port\": {},\n", r.port));
+            out.push_str(&format!("      \"state\": \"{}\",\n", r.state));
+            out.push_str(&format!("      \"service\": \"{}\",\n", Self::escape_json(&r.service_name)));
+            out.push_str(&format!("      \"latency_ms\": {:.3},\n", r.latency.as_secs_f64() * 1000.0));
+            out.push_str(&format!("      \"fingerprint\": \"{}\",\n", Self::escape_json(&r.fingerprint)));
+
+            match &r.banner {
+                Some(b) => out.push_str(&format!("      \"banner\": \"{}\"\n", Self::escape_json(b))),
+                None => out.push_str("      \"banner\": null\n"),
+            }
+
+            if idx + 1 == open_results.len() {
+                out.push_str("    }\n");
+            } else {
+                out.push_str("    },\n");
+            }
+        }
+
+        out.push_str("  ]\n");
+        out.push_str("}\n");
+        out
+    }
+
+    fn escape_json(input: &str) -> String {
+        let mut escaped = String::with_capacity(input.len());
+        for c in input.chars() {
+            match c {
+                '"' => escaped.push_str("\\\""),
+                '\\' => escaped.push_str("\\\\"),
+                '\x08' => escaped.push_str("\\b"),
+                '\x0c' => escaped.push_str("\\f"),
+                '\n' => escaped.push_str("\\n"),
+                '\r' => escaped.push_str("\\r"),
+                '\t' => escaped.push_str("\\t"),
+                '\x00'..='\x1f' => escaped.push_str(&format!("\\u{:04x}", c as u32)),
+                _ => escaped.push(c),
+            }
+        }
+        escaped
+    }
+}
+
+// ============================================================================
+// CLI ARGUMENT PARSER
+// ============================================================================
+
+pub struct CliParser;
+
+impl CliParser {
+    pub fn print_help() {
+        println!("NET-RECON : Concurrent Network Scanner & Reconnaissance Engine");
+        println!();
+        println!("USAGE:");
+        println!("    net_recon [OPTIONS] --target <HOST/IP>");
+        println!();
+        println!("REQUIRED ARGUMENTS:");
+        println!("    -t, --target <HOST/IP>       Target hostname or IPv4/IPv6 address.");
+        println!();
+        println!("SCAN CONFIGURATION:");
+        println!("    -p, --ports <PORTS>          Ports to scan. Formats supported:");
+        println!("                                   - Presets: 'top100', 'all' (1-65535)");
+        println!("                                   - Range:   '1-1024'");
+        println!("                                   - List:    '22,80,443,8080'");
+        println!("                                   - Mixed:   '21-25,80,443,3000-3050'");
+        println!("                                   (Default: top100)");
+        println!("    -w, --workers <NUM>          Worker thread concurrency limit (Default: 50)");
+        println!("    --timeout <MS>               TCP handshake timeout in ms (Default: 1200)");
+        println!("    --banner-timeout <MS>        Banner capture timeout in ms (Default: 1500)");
+        println!("    --delay <MS>                 Rate-limiting sleep between dispatches (Default: 0)");
+        println!();
+        println!("FEATURES & DETECTION:");
+        println!("    --no-banner                  Disable passive banner grabber.");
+        println!("    --probe                      Enable active protocol-specific payload probes.");
+        println!("    -v, --verbose                Enable verbose scanning diagnostic logs.");
+        println!();
+        println!("OUTPUT FORMATS:");
+        println!("    --format <table|json|csv>    Report output format (Default: table)");
+        println!("    -o, --output <FILE>          Export output directly to file path.");
+        println!("    -h, --help                   Display this comprehensive help menu.");
+        println!();
+        println!("EXAMPLES:");
+        println!("    net_recon -t 192.168.1.1 -p 22,80,443 --probe");
+        println!("    net_recon -t scanme.nmap.org -p 1-1000 -w 100 --format json -o scan.json");
+    }
+
+    pub fn parse() -> Result<ScanConfig, String> {
+        let args: Vec<String> = std::env::args().collect();
+        if args.len() <= 1 {
+            Self::print_help();
+            std::process::exit(0);
+        }
+
+        let mut target = None;
+        let mut ports_arg = "top100".to_string();
+        let mut concurrency = DEFAULT_THREAD_COUNT;
+        let mut timeout_ms = DEFAULT_TIMEOUT_MS;
+        let mut banner_timeout_ms = DEFAULT_BANNER_TIMEOUT_MS;
+        let mut delay_ms = DEFAULT_DELAY_MS;
+        let mut grab_banners = true;
+        let mut active_probing = false;
+        let mut format = OutputFormat::Table;
+        let mut output_file = None;
+        let mut verbose = false;
+
+        let mut idx = 1;
+        while idx < args.len() {
+            match args[idx].as_str() {
+                "-h" | "--help" => {
+                    Self::print_help();
+                    std::process::exit(0);
+                }
+                "-t" | "--target" => {
+                    idx += 1;
+                    if idx >= args.len() {
+                        return Err("Missing parameter for --target".to_string());
+                    }
+                    target = Some(args[idx].clone());
+                }
+                "-p" | "--ports" => {
+                    idx += 1;
+                    if idx >= args.len() {
+                        return Err("Missing parameter for --ports".to_string());
+                    }
+                    ports_arg = args[idx].clone();
+                }
+                "-w" | "--workers" => {
+                    idx += 1;
+                    if idx >= args.len() {
+                        return Err("Missing parameter for --workers".to_string());
+                    }
+                    concurrency = args[idx].parse::<usize>().map_err(|_| "Invalid workers count")?;
+                }
+                "--timeout" => {
+                    idx += 1;
+                    if idx >= args.len() {
+                        return Err("Missing parameter for --timeout".to_string());
+                    }
+                    timeout_ms = args[idx].parse::<u64>().map_err(|_| "Invalid timeout integer")?;
+                }
+                "--banner-timeout" => {
+                    idx += 1;
+                    if idx >= args.len() {
+                        return Err("Missing parameter for --banner-timeout".to_string());
+                    }
+                    banner_timeout_ms = args[idx].parse::<u64>().map_err(|_| "Invalid banner-timeout integer")?;
+                }
+                "--delay" => {
+                    idx += 1;
+                    if idx >= args.len() {
+                        return Err("Missing parameter for --delay".to_string());
+                    }
+                    delay_ms = args[idx].parse::<u64>().map_err(|_| "Invalid delay parameter")?;
+                }
+                "--no-banner" => {
+                    grab_banners = false;
+                }
+                "--probe" => {
+                    active_probing = true;
+                }
+                "-v" | "--verbose" => {
+                    verbose = true;
+                }
+                "--format" => {
+                    idx += 1;
+                    if idx >= args.len() {
+                        return Err("Missing parameter for --format".to_string());
+                    }
+                    match args[idx].to_lowercase().as_str() {
+                        "table" => format = OutputFormat::Table,
+                        "json" => format = OutputFormat::Json,
+                        "csv" => format = OutputFormat::Csv,
+                        other => return Err(format!("Unknown format: '{}'", other)),
+                    }
+                }
+                "-o" | "--output" => {
+                    idx += 1;
+                    if idx >= args.len() {
+                        return Err("Missing parameter for --output".to_string());
+                    }
+                    output_file = Some(args[idx].clone());
+                }
+                unknown => {
+                    return Err(format!("Unrecognized CLI option: {}", unknown));
+                }
+            }
+            idx += 1;
+        }
+
+        let target = target.ok_or("Target must be specified with -t or --target")?;
+
+        // Resolve Target to an IP
+        let target_ip = Self::resolve_host(&target)?;
+
+        // Parse Ports
+        let ports = Self::parse_ports(&ports_arg)?;
+
+        if ports.is_empty() {
+            return Err("Parsed port list is empty".to_string());
+        }
+
+        Ok(ScanConfig {
+            target,
+            target_ip,
+            ports,
+            concurrency,
+            timeout: Duration::from_millis(timeout_ms),
+            banner_timeout: Duration::from_millis(banner_timeout_ms),
+            grab_banners,
+            active_probing,
+            output_format: format,
+            output_file,
+            delay_ms,
+            verbose,
+        })
+    }
+
+    fn resolve_host(target: &str) -> Result<IpAddr, String> {
+        let lookup_str = format!("{}:80", target);
+        match lookup_str.to_socket_addrs() {
+            Ok(mut iter) => {
+                if let Some(socket_addr) = iter.next() {
+                    Ok(socket_addr.ip())
+                } else {
+                    Err(format!("Could not resolve domain: {}", target))
+                }
+            }
+            Err(e) => Err(format!("DNS resolution failed for {}: {}", target, e)),
+        }
+    }
+
+    fn parse_ports(input: &str) -> Result<Vec<u16>, String> {
+        let input_trimmed = input.trim().to_lowercase();
+
+        if input_trimmed == "top100" {
+            return Ok(TOP_100_PORTS.to_vec());
+        }
+
+        if input_trimmed == "all" {
+            return Ok((1..=65535).collect());
+        }
+
+        let mut ports = Vec::new();
+        let segments = input.split(',');
+
+        for segment in segments {
+            let item = segment.trim();
+            if item.is_empty() {
+                continue;
+            }
+
+            if item.contains('-') {
+                let parts: Vec<&str> = item.split('-').collect();
+                if parts.len() != 2 {
+                    return Err(format!("Invalid port range: {}", item));
+                }
+
+                let start = parts[0].trim().parse::<u16>().map_err(|_| format!("Invalid start port in {}", item))?;
+                let end = parts[1].trim().parse::<u16>().map_err(|_| format!("Invalid end port in {}", item))?;
+
+                if start > end {
+                    return Err(format!("Start port {} is greater than end port {}", start, end));
+                }
+
+                for p in start..=end {
+                    ports.push(p);
+                }
+            } else {
+                let p = item.parse::<u16>().map_err(|_| format!("Invalid port number: {}", item))?;
+                ports.push(p);
+            }
+        }
+
+        ports.sort_unstable();
+        ports.dedup();
+        Ok(ports)
+    }
+}
+
+// ============================================================================
+// MAIN APPLICATION ORCHESTRATION PIPELINE
+// ============================================================================
+
+fn main() {
+    let config = match CliParser::parse() {
+        Ok(cfg) => cfg,
+        Err(err) => {
+            eprintln!("[ERROR] {}", err);
+            eprintln!("Try 'net_recon --help' for details.");
+            std::process::exit(1);
+        }
+    };
+
+    Reporter::print_banner(&config);
+
+    let total_ports = config.ports.len();
+    let thread_pool = ThreadPool::new(config.concurrency);
+    let (tx, rx) = mpsc::channel::<ScanResult>();
+
+    let completed_counter = Arc::new(AtomicUsize::new(0));
+    let open_counter = Arc::new(AtomicUsize::new(0));
+
+    let scan_start = Instant::now();
+
+    println!("[*] Commencing reconnaissance scan...");
+
+    // Dispatch port scan jobs to the thread pool with optional rate limiting
+    for &port in &config.ports {
+        let tx = tx.clone();
+        let target_ip = config.target_ip;
+        let timeout = config.timeout;
+        let banner_timeout = config.banner_timeout;
+        let grab_banners = config.grab_banners;
+        let active_probing = config.active_probing;
+        let completed = Arc::clone(&completed_counter);
+        let open_count = Arc::clone(&open_counter);
+        let verbose = config.verbose;
+
+        thread_pool.execute(move || {
+            let result = Scanner::scan_port(
+                target_ip,
+                port,
+                timeout,
+                banner_timeout,
+                grab_banners,
+                active_probing,
+            );
+
+            let done = completed.fetch_add(1, Ordering::SeqCst) + 1;
+
+            if result.state == PortState::Open {
+                open_count.fetch_add(1, Ordering::SeqCst);
+                println!(
+                    " [+] Port {:<5} OPEN | Service: {:<12} | Latency: {:.2}ms",
+                    result.port,
+                    result.service_name,
+                    result.latency.as_secs_f64() * 1000.0
+                );
+            } else if verbose {
+                println!(" [-] Port {:<5} {}", result.port, result.state);
+            }
+
+            // Print progress indicator on clean terminal intervals
+            if done % 100 == 0 || done == total_ports {
+                let percent = (done as f64 / total_ports as f64) * 100.0;
+                print!("\r[*] Progress: {:.1}% ({}/{} ports)", percent, done, total_ports);
+                let _ = std::io::stdout().flush();
+            }
+
+            let _ = tx.send(result);
+        });
+
+        if config.delay_ms > 0 {
+            thread::sleep(Duration::from_millis(config.delay_ms));
+        }
+    }
+
+    // Drop the initial sender so receiver unblocks once all workers finish
+    drop(tx);
+
+    // Collect all port scanning results
+    let mut results: Vec<ScanResult> = Vec::with_capacity(total_ports);
+    for res in rx {
+        results.push(res);
+    }
+
+    // Ensure results are ordered sequentially by port
+    results.sort_by_key(|r| r.port);
+
+    let duration = scan_start.elapsed();
+    println!("\n[*] Scan pipeline finished in {:.2?}", duration);
+
+    // Format output
+    let rendered = match config.output_format {
+        OutputFormat::Table => Reporter::format_table(&results, duration),
+        OutputFormat::Json => Reporter::format_json(&results, &config.target, config.target_ip, duration),
+        OutputFormat::Csv => Reporter::format_csv(&results),
+    };
+
+    // Print final report or save to destination file
+    if let Some(ref path) = config.output_file {
+        match std::fs::File::create(path) {
+            Ok(mut file) => {
+                if file.write_all(rendered.as_bytes()).is_ok() {
+                    println!("[+] Report successfully exported to file: {}", path);
+                } else {
+                    eprintln!("[!] Failed to write contents to file: {}", path);
+                }
+            }
+            Err(e) => {
+                eprintln!("[!] Could not create output file {}: {}", path, e);
+            }
+        }
+    } else {
+        println!("{}", rendered);
+    }
+
+    let total_open = open_counter.load(Ordering::SeqCst);
+    println!(
+        "[*] Summary: Target {} had {} open ports out of {} probed.",
+        config.target_ip, total_open, total_ports
+    );
+}
+
+// ============================================================================
+// COMPREHENSIVE INTEGRATION & UNIT TESTS
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_port_parse_single() {
+        let p = CliParser::parse_ports("80").unwrap();
+        assert_eq!(p, vec![80]);
+    }
+
+    #[test]
+    fn test_port_parse_range() {
+        let p = CliParser::parse_ports("20-23").unwrap();
+        assert_eq!(p, vec![20, 21, 22, 23]);
+    }
+
+    #[test]
+    fn test_port_parse_mixed() {
+        let p = CliParser::parse_ports("22,80-82,443").unwrap();
+        assert_eq!(p, vec![22, 80, 81, 82, 443]);
+    }
+
+    #[test]
+    fn test_port_parse_top100() {
+        let p = CliParser::parse_ports("top100").unwrap();
+        assert_eq!(p.len(), TOP_100_PORTS.len());
+        assert!(p.contains(&80));
+        assert!(p.contains(&443));
+    }
+
+    #[test]
+    fn test_sanitize_bytes() {
+        let dirty = b"SSH-2.0-OpenSSH_8.9p1\r\n\x00\x01test";
+        let clean = BannerGrabber::sanitize_bytes(dirty);
+        assert_eq!(clean, "SSH-2.0-OpenSSH_8.9p1\n..test");
+    }
+
+    #[test]
+    fn test_fingerprint_ssh() {
+        let banner = "SSH-2.0-OpenSSH_8.2p1 Ubuntu-4ubuntu0.5";
+        let (svc, fp) = Fingerprinter::identify(22, Some(banner));
+        assert_eq!(svc, "ssh");
+        assert!(fp.contains("OpenSSH_8.2p1"));
+    }
+
+    #[test]
+    fn test_fingerprint_http() {
+        let banner = "HTTP/1.1 200 OK\r\nServer: nginx/1.18.0\r\nContent-Type: text/html";
+        let (svc, fp) = Fingerprinter::identify(80, Some(banner));
+        assert_eq!(svc, "http");
+        assert!(fp.contains("nginx/1.18.0"));
+    }
+
+    #[test]
+    fn test_threadpool_execution() {
+        let pool = ThreadPool::new(4);
+        let counter = Arc::new(AtomicUsize::new(0));
+
+        for _ in 0..10 {
+            let c = Arc::clone(&counter);
+            pool.execute(move || {
+                c.fetch_add(1, Ordering::SeqCst);
+            });
+        }
+
+        // Drop forces all threads to finish their jobs
+        drop(pool);
+        assert_eq!(counter.load(Ordering::SeqCst), 10);
+    }
+
+    #[test]
+    fn test_json_escaping() {
+        let raw = "Hello \"World\"\nLine 2\\Test";
+        let escaped = Reporter::escape_json(raw);
+        assert_eq!(escaped, "Hello \\\"World\\\"\\nLine 2\\\\Test");
+    }
+}
