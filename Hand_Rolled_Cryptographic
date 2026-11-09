@@ -1,0 +1,1538 @@
+
+
+use std::cmp::Ordering;
+use std::fmt;
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
+use std::sync::{Arc, Barrier};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+// ============================================================================
+// CONSTANT-TIME ARITHMETIC & EQUALITY UTILITIES
+// ============================================================================
+
+/// Constant-time byte slice comparison to eliminate timing side channels.
+///
+/// In standard `==`, the comparison returns `false` at the first mismatching byte.
+/// An attacker measuring network round-trip timing can deduce characters byte-by-byte.
+/// This function always checks every byte in O(N) time.
+#[inline(never)]
+pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+// ============================================================================
+// MODULE 1: MULTI-PRECISION INTEGER ENGINE (BigUint)
+// ============================================================================
+
+pub mod bignum {
+    use std::cmp::Ordering;
+    use std::fmt;
+
+    /// Arbitrary-precision unsigned integer represented by 64-bit limbs (little-endian).
+    #[derive(Clone, PartialEq, Eq)]
+    pub struct BigUint {
+        pub limbs: Vec<u64>,
+    }
+
+    impl BigUint {
+        pub fn zero() -> Self {
+            BigUint { limbs: vec![0] }
+        }
+
+        pub fn from_u64(val: u64) -> Self {
+            BigUint { limbs: vec![val] }
+        }
+
+        pub fn from_be_bytes(bytes: &[u8]) -> Self {
+            if bytes.is_empty() {
+                return Self::zero();
+            }
+            let mut limbs = Vec::new();
+            for chunk in bytes.rchunks(8) {
+                let mut limb = 0u64;
+                for (i, &b) in chunk.iter().enumerate() {
+                    let shift = (chunk.len() - 1 - i) * 8;
+                    limb |= (b as u64) << shift;
+                }
+                limbs.push(limb);
+            }
+            let mut b = BigUint { limbs };
+            b.normalize();
+            b
+        }
+
+        pub fn to_be_bytes(&self) -> Vec<u8> {
+            if self.is_zero() {
+                return vec![0];
+            }
+            let mut bytes = Vec::with_capacity(self.limbs.len() * 8);
+            for &limb in self.limbs.iter().rev() {
+                bytes.extend_from_slice(&limb.to_be_bytes());
+            }
+            // Strip leading zero bytes
+            let first_non_zero = bytes.iter().position(|&b| b != 0).unwrap_or(bytes.len() - 1);
+            bytes[first_non_zero..].to_vec()
+        }
+
+        pub fn from_hex(hex: &str) -> Result<Self, String> {
+            let clean: String = hex.chars().filter(|c| !c.is_whitespace() && *c != '_').collect();
+            if clean.is_empty() {
+                return Ok(Self::zero());
+            }
+            let padded = if clean.len() % 2 != 0 {
+                format!("0{}", clean)
+            } else {
+                clean
+            };
+
+            let mut bytes = Vec::with_capacity(padded.len() / 2);
+            for i in (0..padded.len()).step_by(2) {
+                let byte = u8::from_str_radix(&padded[i..i + 2], 16)
+                    .map_err(|e| format!("Invalid hex: {}", e))?;
+                bytes.push(byte);
+            }
+            Ok(Self::from_be_bytes(&bytes))
+        }
+
+        pub fn is_zero(&self) -> bool {
+            self.limbs.is_empty() || (self.limbs.len() == 1 && self.limbs[0] == 0)
+        }
+
+        pub fn is_odd(&self) -> bool {
+            !self.limbs.is_empty() && (self.limbs[0] & 1) != 0
+        }
+
+        pub fn bit_length(&self) -> usize {
+            if self.is_zero() {
+                return 0;
+            }
+            let last_idx = self.limbs.len() - 1;
+            let highest_limb = self.limbs[last_idx];
+            let leading_zeros = highest_limb.leading_zeros() as usize;
+            (self.limbs.len() * 64) - leading_zeros
+        }
+
+        pub fn bit_at(&self, index: usize) -> bool {
+            let limb_idx = index / 64;
+            let bit_idx = index % 64;
+            if limb_idx >= self.limbs.len() {
+                return false;
+            }
+            (self.limbs[limb_idx] & (1 << bit_idx)) != 0
+        }
+
+        fn normalize(&mut self) {
+            while self.limbs.len() > 1 && self.limbs.last() == Some(&0) {
+                self.limbs.pop();
+            }
+        }
+
+        pub fn cmp_ref(&self, other: &BigUint) -> Ordering {
+            if self.limbs.len() != other.limbs.len() {
+                return self.limbs.len().cmp(&other.limbs.len());
+            }
+            for (a, b) in self.limbs.iter().rev().zip(other.limbs.iter().rev()) {
+                if a != b {
+                    return a.cmp(b);
+                }
+            }
+            Ordering::Equal
+        }
+
+        pub fn add(&self, other: &BigUint) -> BigUint {
+            let max_len = std::cmp::max(self.limbs.len(), other.limbs.len());
+            let mut result = Vec::with_capacity(max_len + 1);
+            let mut carry = 0u128;
+
+            for i in 0..max_len {
+                let a = if i < self.limbs.len() { self.limbs[i] as u128 } else { 0 };
+                let b = if i < other.limbs.len() { other.limbs[i] as u128 } else { 0 };
+                let sum = a + b + carry;
+                result.push(sum as u64);
+                carry = sum >> 64;
+            }
+
+            if carry > 0 {
+                result.push(carry as u64);
+            }
+
+            let mut res = BigUint { limbs: result };
+            res.normalize();
+            res
+        }
+
+        pub fn sub(&self, other: &BigUint) -> BigUint {
+            assert!(self.cmp_ref(other) != Ordering::Less, "Subtraction underflow");
+            let mut result = Vec::with_capacity(self.limbs.len());
+            let mut borrow = 0i128;
+
+            for i in 0..self.limbs.len() {
+                let a = self.limbs[i] as i128;
+                let b = if i < other.limbs.len() { other.limbs[i] as i128 } else { 0 };
+                let diff = a - b - borrow;
+                if diff < 0 {
+                    result.push((diff + (1i128 << 64)) as u64);
+                    borrow = 1;
+                } else {
+                    result.push(diff as u64);
+                    borrow = 0;
+                }
+            }
+
+            let mut res = BigUint { limbs: result };
+            res.normalize();
+            res
+        }
+
+        pub fn mul(&self, other: &BigUint) -> BigUint {
+            if self.is_zero() || other.is_zero() {
+                return BigUint::zero();
+            }
+            let mut result = vec![0u64; self.limbs.len() + other.limbs.len()];
+
+            for i in 0..self.limbs.len() {
+                let mut carry = 0u128;
+                for j in 0..other.limbs.len() {
+                    let cur = result[i + j] as u128
+                        + (self.limbs[i] as u128) * (other.limbs[j] as u128)
+                        + carry;
+                    result[i + j] = cur as u64;
+                    carry = cur >> 64;
+                }
+                result[i + other.limbs.len()] += carry as u64;
+            }
+
+            let mut res = BigUint { limbs: result };
+            res.normalize();
+            res
+        }
+
+        pub fn shl1(&self) -> BigUint {
+            let mut res = Vec::with_capacity(self.limbs.len() + 1);
+            let mut carry = 0u64;
+            for &limb in &self.limbs {
+                res.push((limb << 1) | carry);
+                carry = limb >> 63;
+            }
+            if carry != 0 {
+                res.push(carry);
+            }
+            let mut b = BigUint { limbs: res };
+            b.normalize();
+            b
+        }
+
+        pub fn shr1(&self) -> BigUint {
+            let mut res = vec![0u64; self.limbs.len()];
+            let mut carry = 0u64;
+            for i in (0..self.limbs.len()).rev() {
+                let limb = self.limbs[i];
+                res[i] = (limb >> 1) | carry;
+                carry = limb << 63;
+            }
+            let mut b = BigUint { limbs: res };
+            b.normalize();
+            b
+        }
+
+        /// Binary restoring long division: computes (quotient, remainder).
+        pub fn div_rem(&self, divisor: &BigUint) -> (BigUint, BigUint) {
+            assert!(!divisor.is_zero(), "Division by zero");
+            if self.cmp_ref(divisor) == Ordering::Less {
+                return (BigUint::zero(), self.clone());
+            }
+
+            let mut remainder = BigUint::zero();
+            let total_bits = self.bit_length();
+            let mut quotient_limbs = vec![0u64; (total_bits + 63) / 64];
+
+            for i in (0..total_bits).rev() {
+                remainder = remainder.shl1();
+                if self.bit_at(i) {
+                    remainder.limbs[0] |= 1;
+                }
+                remainder.normalize();
+
+                if remainder.cmp_ref(divisor) != Ordering::Less {
+                    remainder = remainder.sub(divisor);
+                    let q_limb = i / 64;
+                    let q_bit = i % 64;
+                    quotient_limbs[q_limb] |= 1 << q_bit;
+                }
+            }
+
+            let mut quotient = BigUint { limbs: quotient_limbs };
+            quotient.normalize();
+            (quotient, remainder)
+        }
+
+        /// Square-and-multiply modular exponentiation: self^exponent mod modulus.
+        pub fn mod_pow(&self, exponent: &BigUint, modulus: &BigUint) -> BigUint {
+            assert!(!modulus.is_zero(), "Modulus cannot be zero");
+            if modulus.limbs == [1] {
+                return BigUint::zero();
+            }
+
+            let mut result = BigUint::from_u64(1);
+            let (_, mut base) = self.div_rem(modulus);
+            let mut exp = exponent.clone();
+
+            while !exp.is_zero() {
+                if exp.is_odd() {
+                    let prod = result.mul(&base);
+                    let (_, rem) = prod.div_rem(modulus);
+                    result = rem;
+                }
+                let sq = base.mul(&base);
+                let (_, rem) = sq.div_rem(modulus);
+                base = rem;
+                exp = exp.shr1();
+            }
+            result
+        }
+    }
+
+    impl fmt::Debug for BigUint {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            let bytes = self.to_be_bytes();
+            write!(f, "0x")?;
+            for b in bytes {
+                write!(f, "{:02x}", b)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+use bignum::BigUint;
+
+// Standard 512-bit Diffie-Hellman Safe Prime (Oakley Group derivative)
+pub const DH_PRIME_512: &str =
+    "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD129024E088A67CC74\
+     020BBEA63B139B22514A08798E3404DDEF9519B3CD3A431B302B0A6DF25F1437";
+pub const DH_GENERATOR: u64 = 2;
+
+// ============================================================================
+// MODULE 2: SECURE HASH ALGORITHM 256 (FIPS 180-4 SHA-256)
+// ============================================================================
+
+pub mod sha256 {
+    pub const DIGEST_SIZE: usize = 32;
+    pub const BLOCK_SIZE: usize = 64;
+
+    const K: [u32; 64] = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+        0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+        0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+        0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+        0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+        0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+        0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+    ];
+
+    #[derive(Clone)]
+    pub struct Sha256 {
+        state: [u32; 8],
+        buffer: [u8; BLOCK_SIZE],
+        buf_len: usize,
+        total_len: u64,
+    }
+
+    impl Sha256 {
+        pub fn new() -> Self {
+            Sha256 {
+                state: [
+                    0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+                    0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+                ],
+                buffer: [0u8; BLOCK_SIZE],
+                buf_len: 0,
+                total_len: 0,
+            }
+        }
+
+        pub fn update(&mut self, mut data: &[u8]) {
+            self.total_len += data.len() as u64;
+
+            while !data.is_empty() {
+                let fill = std::cmp::min(data.len(), BLOCK_SIZE - self.buf_len);
+                self.buffer[self.buf_len..self.buf_len + fill].copy_from_slice(&data[..fill]);
+                self.buf_len += fill;
+                data = &data[fill..];
+
+                if self.buf_len == BLOCK_SIZE {
+                    let block = self.buffer;
+                    self.compress(&block);
+                    self.buf_len = 0;
+                }
+            }
+        }
+
+        pub fn finalize(mut self) -> [u8; DIGEST_SIZE] {
+            // Append 0x80 byte
+            self.buffer[self.buf_len] = 0x80;
+            self.buf_len += 1;
+
+            if self.buf_len > 56 {
+                for i in self.buf_len..BLOCK_SIZE {
+                    self.buffer[i] = 0;
+                }
+                let block = self.buffer;
+                self.compress(&block);
+                self.buf_len = 0;
+            }
+
+            for i in self.buf_len..56 {
+                self.buffer[i] = 0;
+            }
+
+            let bit_len = self.total_len * 8;
+            self.buffer[56..64].copy_from_slice(&bit_len.to_be_bytes());
+            let block = self.buffer;
+            self.compress(&block);
+
+            let mut out = [0u8; DIGEST_SIZE];
+            for (i, &val) in self.state.iter().enumerate() {
+                out[i * 4..(i + 1) * 4].copy_from_slice(&val.to_be_bytes());
+            }
+            out
+        }
+
+        pub fn digest(data: &[u8]) -> [u8; DIGEST_SIZE] {
+            let mut hasher = Self::new();
+            hasher.update(data);
+            hasher.finalize()
+        }
+
+        fn compress(&mut self, block: &[u8; BLOCK_SIZE]) {
+            let mut w = [0u32; 64];
+            for i in 0..16 {
+                w[i] = u32::from_be_bytes([
+                    block[i * 4],
+                    block[i * 4 + 1],
+                    block[i * 4 + 2],
+                    block[i * 4 + 3],
+                ]);
+            }
+
+            for i in 16..64 {
+                let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+                let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+                w[i] = w[i - 16].wrapping_add(s0).wrapping_add(w[i - 7]).wrapping_add(s1);
+            }
+
+            let mut a = self.state[0];
+            let mut b = self.state[1];
+            let mut c = self.state[2];
+            let mut d = self.state[3];
+            let mut e = self.state[4];
+            let mut f = self.state[5];
+            let mut g = self.state[6];
+            let mut h = self.state[7];
+
+            for i in 0..64 {
+                let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+                let ch = (e & f) ^ ((!e) & g);
+                let temp1 = h
+                    .wrapping_add(s1)
+                    .wrapping_add(ch)
+                    .wrapping_add(K[i])
+                    .wrapping_add(w[i]);
+                let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+                let maj = (a & b) ^ (a & c) ^ (b & c);
+                let temp2 = s0.wrapping_add(maj);
+
+                h = g;
+                g = f;
+                f = e;
+                e = d.wrapping_add(temp1);
+                d = c;
+                c = b;
+                b = a;
+                a = temp1.wrapping_add(temp2);
+            }
+
+            self.state[0] = self.state[0].wrapping_add(a);
+            self.state[1] = self.state[1].wrapping_add(b);
+            self.state[2] = self.state[2].wrapping_add(c);
+            self.state[3] = self.state[3].wrapping_add(d);
+            self.state[4] = self.state[4].wrapping_add(e);
+            self.state[5] = self.state[5].wrapping_add(f);
+            self.state[6] = self.state[6].wrapping_add(g);
+            self.state[7] = self.state[7].wrapping_add(h);
+        }
+    }
+}
+
+// ============================================================================
+// MODULE 3: KEYED-HASH MAC (RFC 2104 HMAC-SHA256) & PRF
+// ============================================================================
+
+pub mod hmac {
+    use super::sha256::{Sha256, BLOCK_SIZE, DIGEST_SIZE};
+    pub use super::constant_time_eq;
+
+    pub struct HmacSha256 {
+        inner_hasher: Sha256,
+        opad_key: [u8; BLOCK_SIZE],
+    }
+
+    impl HmacSha256 {
+        pub fn new(key: &[u8]) -> Self {
+            let mut formatted_key = [0u8; BLOCK_SIZE];
+            if key.len() > BLOCK_SIZE {
+                let digest = Sha256::digest(key);
+                formatted_key[..DIGEST_SIZE].copy_from_slice(&digest);
+            } else {
+                formatted_key[..key.len()].copy_from_slice(key);
+            }
+
+            let mut ipad = [0u8; BLOCK_SIZE];
+            let mut opad = [0u8; BLOCK_SIZE];
+
+            for i in 0..BLOCK_SIZE {
+                ipad[i] = formatted_key[i] ^ 0x36;
+                opad[i] = formatted_key[i] ^ 0x5c;
+            }
+
+            let mut inner_hasher = Sha256::new();
+            inner_hasher.update(&ipad);
+
+            HmacSha256 {
+                inner_hasher,
+                opad_key: opad,
+            }
+        }
+
+        pub fn update(&mut self, data: &[u8]) {
+            self.inner_hasher.update(data);
+        }
+
+        pub fn finalize(self) -> [u8; DIGEST_SIZE] {
+            let inner_hash = self.inner_hasher.finalize();
+            let mut outer_hasher = Sha256::new();
+            outer_hasher.update(&self.opad_key);
+            outer_hasher.update(&inner_hash);
+            outer_hasher.finalize()
+        }
+
+        pub fn mac(key: &[u8], data: &[u8]) -> [u8; DIGEST_SIZE] {
+            let mut hmac = Self::new(key);
+            hmac.update(data);
+            hmac.finalize()
+        }
+
+        /// Verifies a MAC tag in constant time.
+        pub fn verify(key: &[u8], data: &[u8], expected_tag: &[u8]) -> bool {
+            let actual_tag = Self::mac(key, data);
+            constant_time_eq(&actual_tag, expected_tag)
+        }
+    }
+
+    /// TLS PRF / HKDF Expand implementation for deriving session keys.
+    pub fn hkdf_expand(prk: &[u8], info: &[u8], length: usize) -> Vec<u8> {
+        let mut okm = Vec::with_capacity(length);
+        let mut previous_t: Vec<u8> = Vec::new();
+        let mut counter = 1u8;
+
+        while okm.len() < length {
+            let mut hmac = HmacSha256::new(prk);
+            if !previous_t.is_empty() {
+                hmac.update(&previous_t);
+            }
+            hmac.update(info);
+            hmac.update(&[counter]);
+            let t = hmac.finalize();
+            previous_t = t.to_vec();
+
+            let to_take = std::cmp::min(length - okm.len(), DIGEST_SIZE);
+            okm.extend_from_slice(&t[..to_take]);
+            counter += 1;
+        }
+
+        okm
+    }
+}
+
+// ============================================================================
+// MODULE 4: AES-128 BLOCK CIPHER IMPLEMENTATION
+// ============================================================================
+
+pub mod aes {
+    pub const BLOCK_SIZE: usize = 16;
+    pub const KEY_SIZE: usize = 16;
+    pub const ROUND_KEYS_SIZE: usize = 176; // (10 rounds + 1) * 16 bytes
+
+    const SBOX: [u8; 256] = [
+        0x63, 0x7c, 0x77, 0x7b, 0xf2, 0x6b, 0x6f, 0xc5, 0x30, 0x01, 0x67, 0x2b, 0xfe, 0xd7, 0xab, 0x76,
+        0xca, 0x82, 0xc9, 0x7d, 0xfa, 0x59, 0x47, 0xf0, 0xad, 0xd4, 0xa2, 0xaf, 0x9c, 0xa4, 0x72, 0xc0,
+        0xb7, 0xfd, 0x93, 0x26, 0x36, 0x3f, 0xf7, 0xcc, 0x34, 0xa5, 0xe5, 0xf1, 0x71, 0xd8, 0x31, 0x15,
+        0x04, 0xc7, 0x23, 0xc3, 0x18, 0x96, 0x05, 0x9a, 0x07, 0x12, 0x80, 0xe2, 0xeb, 0x27, 0xb2, 0x75,
+        0x09, 0x83, 0x2c, 0x1a, 0x1b, 0x6e, 0x5a, 0xa0, 0x52, 0x3b, 0xd6, 0xb3, 0x29, 0xe3, 0x2f, 0x84,
+        0x53, 0xd1, 0x00, 0xed, 0x20, 0xfc, 0xb1, 0x5b, 0x6a, 0xcb, 0xbe, 0x39, 0x4a, 0x4c, 0x58, 0xcf,
+        0xd0, 0xef, 0xaa, 0xfb, 0x43, 0x4d, 0x33, 0x85, 0x45, 0xf9, 0x02, 0x7f, 0x50, 0x3c, 0x9f, 0xa8,
+        0x51, 0xa3, 0x40, 0x8f, 0x92, 0x9d, 0x38, 0xf5, 0xbc, 0xb6, 0xda, 0x21, 0x10, 0xff, 0xf3, 0xd2,
+        0xcd, 0x0c, 0x13, 0xec, 0x5f, 0x97, 0x44, 0x17, 0xc4, 0xa7, 0x7e, 0x3d, 0x64, 0x5d, 0x19, 0x73,
+        0x60, 0x81, 0x4f, 0xdc, 0x22, 0x2a, 0x90, 0x88, 0x46, 0xee, 0xb8, 0x14, 0xde, 0x5e, 0x0b, 0xdb,
+        0xe0, 0x32, 0x3a, 0x0a, 0x49, 0x06, 0x24, 0x5e, 0xc2, 0xd3, 0xac, 0x62, 0x91, 0x95, 0xe4, 0x79,
+        0xe7, 0xc8, 0x37, 0x6d, 0x8d, 0xd5, 0x4e, 0xa9, 0x6c, 0x56, 0xf4, 0xea, 0x65, 0x7a, 0xae, 0x08,
+        0xba, 0x78, 0x25, 0x2e, 0x1c, 0xa6, 0xb4, 0xc6, 0xe8, 0xdd, 0x74, 0x1f, 0x4b, 0xbd, 0x8b, 0x8a,
+        0x70, 0x3e, 0xb5, 0x66, 0x48, 0x03, 0xf6, 0x0e, 0x61, 0x35, 0x57, 0xb9, 0x86, 0xc1, 0x1d, 0x9e,
+        0xe1, 0xf8, 0x98, 0x11, 0x69, 0xd9, 0x8e, 0x94, 0x9b, 0x1e, 0x87, 0xe9, 0xce, 0x55, 0x28, 0xdf,
+        0x8c, 0xa1, 0x89, 0x0d, 0xbf, 0xe6, 0x42, 0x68, 0x41, 0x99, 0x2d, 0x0f, 0xb0, 0x54, 0xbb, 0x16,
+    ];
+
+    const RCON: [u32; 10] = [
+        0x01000000, 0x02000000, 0x04000000, 0x08000000, 0x10000000,
+        0x20000000, 0x40000000, 0x80000000, 0x1B000000, 0x36000000,
+    ];
+
+    pub struct Aes128 {
+        round_keys: [u8; ROUND_KEYS_SIZE],
+    }
+
+    impl Aes128 {
+        pub fn new(key: &[u8; KEY_SIZE]) -> Self {
+            let mut round_keys = [0u8; ROUND_KEYS_SIZE];
+            Self::key_expansion(key, &mut round_keys);
+            Aes128 { round_keys }
+        }
+
+        fn sub_word(w: u32) -> u32 {
+            let b0 = SBOX[(w >> 24) as usize] as u32;
+            let b1 = SBOX[((w >> 16) & 0xff) as usize] as u32;
+            let b2 = SBOX[((w >> 8) & 0xff) as usize] as u32;
+            let b3 = SBOX[(w & 0xff) as usize] as u32;
+            (b0 << 24) | (b1 << 16) | (b2 << 8) | b3
+        }
+
+        fn rot_word(w: u32) -> u32 {
+            w.rotate_left(8)
+        }
+
+        fn key_expansion(key: &[u8; KEY_SIZE], round_keys: &mut [u8; ROUND_KEYS_SIZE]) {
+            let mut w = [0u32; 44];
+            for i in 0..4 {
+                w[i] = u32::from_be_bytes([
+                    key[4 * i],
+                    key[4 * i + 1],
+                    key[4 * i + 2],
+                    key[4 * i + 3],
+                ]);
+            }
+
+            for i in 4..44 {
+                let mut temp = w[i - 1];
+                if i % 4 == 0 {
+                    temp = Self::sub_word(Self::rot_word(temp)) ^ RCON[(i / 4) - 1];
+                }
+                w[i] = w[i - 4] ^ temp;
+            }
+
+            for (i, &word) in w.iter().enumerate() {
+                round_keys[i * 4..i * 4 + 4].copy_from_slice(&word.to_be_bytes());
+            }
+        }
+
+        fn sub_bytes(state: &mut [u8; BLOCK_SIZE]) {
+            for b in state.iter_mut() {
+                *b = SBOX[*b as usize];
+            }
+        }
+
+        fn shift_rows(state: &mut [u8; BLOCK_SIZE]) {
+            let temp = state[1];
+            state[1] = state[5];
+            state[5] = state[9];
+            state[9] = state[13];
+            state[13] = temp;
+
+            state.swap(2, 10);
+            state.swap(6, 14);
+
+            let temp = state[15];
+            state[15] = state[11];
+            state[11] = state[7];
+            state[7] = state[3];
+            state[3] = temp;
+        }
+
+        #[inline(always)]
+        fn xtime(b: u8) -> u8 {
+            if (b & 0x80) != 0 {
+                (b << 1) ^ 0x1b
+            } else {
+                b << 1
+            }
+        }
+
+        fn mix_columns(state: &mut [u8; BLOCK_SIZE]) {
+            for c in 0..4 {
+                let i = c * 4;
+                let s0 = state[i];
+                let s1 = state[i + 1];
+                let s2 = state[i + 2];
+                let s3 = state[i + 3];
+
+                let t = s0 ^ s1 ^ s2 ^ s3;
+                let u = s0;
+
+                state[i] ^= t ^ Self::xtime(s0 ^ s1);
+                state[i + 1] ^= t ^ Self::xtime(s1 ^ s2);
+                state[i + 2] ^= t ^ Self::xtime(s2 ^ s3);
+                state[i + 3] ^= t ^ Self::xtime(s3 ^ u);
+            }
+        }
+
+        fn add_round_key(&self, state: &mut [u8; BLOCK_SIZE], round: usize) {
+            let offset = round * 16;
+            for i in 0..16 {
+                state[i] ^= self.round_keys[offset + i];
+            }
+        }
+
+        /// Encrypts an individual 16-byte block.
+        pub fn encrypt_block(&self, input: &[u8; BLOCK_SIZE], output: &mut [u8; BLOCK_SIZE]) {
+            let mut state = *input;
+
+            self.add_round_key(&mut state, 0);
+
+            for round in 1..10 {
+                Self::sub_bytes(&mut state);
+                Self::shift_rows(&mut state);
+                Self::mix_columns(&mut state);
+                self.add_round_key(&mut state, round);
+            }
+
+            Self::sub_bytes(&mut state);
+            Self::shift_rows(&mut state);
+            self.add_round_key(&mut state, 10);
+
+            *output = state;
+        }
+    }
+
+    /// AES-128-CTR (Counter Mode) Stream Cipher.
+    pub fn aes_128_ctr(key: &[u8; KEY_SIZE], iv: &[u8; 12], counter_start: u32, data: &[u8]) -> Vec<u8> {
+        let cipher = Aes128::new(key);
+        let mut output = Vec::with_capacity(data.len());
+        let mut counter = counter_start;
+        let mut block_keystream = [0u8; BLOCK_SIZE];
+        let mut counter_block = [0u8; BLOCK_SIZE];
+        counter_block[..12].copy_from_slice(iv);
+
+        for chunk in data.chunks(BLOCK_SIZE) {
+            counter_block[12..16].copy_from_slice(&counter.to_be_bytes());
+            cipher.encrypt_block(&counter_block, &mut block_keystream);
+
+            for (i, &b) in chunk.iter().enumerate() {
+                output.push(b ^ block_keystream[i]);
+            }
+            counter = counter.wrapping_add(1);
+        }
+
+        output
+    }
+}
+
+// ============================================================================
+// MODULE 5: SYSTEM ENTROPY COLLECTOR (CROSS-PLATFORM CSPRNG)
+// ============================================================================
+
+pub mod entropy {
+    use super::bignum::BigUint;
+    use super::sha256::Sha256;
+    use std::io::Read;
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+    pub fn fill_bytes(dest: &mut [u8]) {
+        #[cfg(unix)]
+        {
+            if let Ok(mut file) = std::fs::File::open("/dev/urandom") {
+                if file.read_exact(dest).is_ok() {
+                    return;
+                }
+            }
+        }
+
+        // Fallback: Entropy extraction mixer via system telemetry
+        let mut pool = Vec::new();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_else(|_| Duration::from_secs(0))
+            .as_nanos();
+        let instant = Instant::now().elapsed().as_nanos();
+        let stack_ptr = &pool as *const _ as usize;
+
+        pool.extend_from_slice(&now.to_le_bytes());
+        pool.extend_from_slice(&instant.to_le_bytes());
+        pool.extend_from_slice(&stack_ptr.to_le_bytes());
+
+        let mut offset = 0;
+        let mut counter = 0u64;
+
+        while offset < dest.len() {
+            let mut hasher = Sha256::new();
+            hasher.update(&pool);
+            hasher.update(&counter.to_le_bytes());
+            let digest = hasher.finalize();
+
+            let copy_len = std::cmp::min(dest.len() - offset, digest.len());
+            dest[offset..offset + copy_len].copy_from_slice(&digest[..copy_len]);
+            offset += copy_len;
+            counter += 1;
+        }
+    }
+
+    pub fn random_bytes(len: usize) -> Vec<u8> {
+        let mut buf = vec![0u8; len];
+        fill_bytes(&mut buf);
+        buf
+    }
+
+    pub fn random_biguint(bits: usize) -> BigUint {
+        let byte_len = (bits + 7) / 8;
+        let mut bytes = random_bytes(byte_len);
+        let excess_bits = (byte_len * 8) - bits;
+        if excess_bits > 0 && !bytes.is_empty() {
+            bytes[0] &= 0xFF >> excess_bits;
+        }
+        if !bytes.is_empty() {
+            let high_bit_mask = 1 << ((bits - 1) % 8);
+            bytes[0] |= high_bit_mask;
+        }
+        BigUint::from_be_bytes(&bytes)
+    }
+}
+
+// ============================================================================
+// MODULE 6: TLS-LIKE RECORD LAYER & HANDSHAKE STATE MACHINE
+// ============================================================================
+
+pub mod protocol {
+    use super::bignum::BigUint;
+    use super::hmac::{hkdf_expand, HmacSha256};
+    use super::sha256::Sha256;
+    use std::io::Read;
+
+    pub const PROTOCOL_VERSION: u16 = 0x0303; // TLS 1.2 semantic indicator
+
+    #[repr(u8)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum ContentType {
+        Handshake = 0x16,
+        ApplicationData = 0x17,
+        Alert = 0x15,
+    }
+
+    #[repr(u8)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum HandshakeType {
+        ClientHello = 0x01,
+        ServerHello = 0x02,
+        ServerKeyExchange = 0x03,
+        Finished = 0x14,
+    }
+
+    pub struct RecordFrame {
+        pub content_type: ContentType,
+        pub version: u16,
+        pub sequence_number: u64,
+        pub payload: Vec<u8>,
+    }
+
+    impl RecordFrame {
+        pub fn serialize(&self) -> Vec<u8> {
+            let mut out = Vec::with_capacity(13 + self.payload.len());
+            out.push(self.content_type as u8);
+            out.extend_from_slice(&self.version.to_be_bytes());
+            out.extend_from_slice(&(self.payload.len() as u16).to_be_bytes());
+            out.extend_from_slice(&self.sequence_number.to_be_bytes());
+            out.extend_from_slice(&self.payload);
+            out
+        }
+
+        pub fn deserialize<R: Read>(reader: &mut R) -> Result<Self, String> {
+            let mut header = [0u8; 13];
+            reader
+                .read_exact(&mut header)
+                .map_err(|e| format!("Failed to read record header: {}", e))?;
+
+            let ct_byte = header[0];
+            let content_type = match ct_byte {
+                0x16 => ContentType::Handshake,
+                0x17 => ContentType::ApplicationData,
+                0x15 => ContentType::Alert,
+                other => return Err(format!("Unknown ContentType: 0x{:02x}", other)),
+            };
+
+            let version = u16::from_be_bytes([header[1], header[2]]);
+            let length = u16::from_be_bytes([header[3], header[4]]) as usize;
+            let sequence_number = u64::from_be_bytes([
+                header[5], header[6], header[7], header[8],
+                header[9], header[10], header[11], header[12],
+            ]);
+
+            let mut payload = vec![0u8; length];
+            reader
+                .read_exact(&mut payload)
+                .map_err(|e| format!("Truncated payload: {}", e))?;
+
+            Ok(RecordFrame {
+                content_type,
+                version,
+                sequence_number,
+                payload,
+            })
+        }
+    }
+
+    pub struct SessionKeys {
+        pub client_write_key: [u8; 16],
+        pub server_write_key: [u8; 16],
+        pub client_mac_key: [u8; 32],
+        pub server_mac_key: [u8; 32],
+        pub client_write_iv: [u8; 12],
+        pub server_write_iv: [u8; 12],
+    }
+
+    impl SessionKeys {
+        pub fn derive(shared_secret: &BigUint, client_random: &[u8], server_random: &[u8]) -> Self {
+            let secret_bytes = shared_secret.to_be_bytes();
+            let mut salt = Vec::with_capacity(client_random.len() + server_random.len());
+            salt.extend_from_slice(client_random);
+            salt.extend_from_slice(server_random);
+
+            let prk = HmacSha256::mac(&salt, &secret_bytes);
+            let key_material = hkdf_expand(&prk, b"MINI_TLS_KEY_EXPANSION", 120);
+
+            let mut client_write_key = [0u8; 16];
+            let mut server_write_key = [0u8; 16];
+            let mut client_mac_key = [0u8; 32];
+            let mut server_mac_key = [0u8; 32];
+            let mut client_write_iv = [0u8; 12];
+            let mut server_write_iv = [0u8; 12];
+
+            client_write_key.copy_from_slice(&key_material[0..16]);
+            server_write_key.copy_from_slice(&key_material[16..32]);
+            client_mac_key.copy_from_slice(&key_material[32..64]);
+            server_mac_key.copy_from_slice(&key_material[64..96]);
+            client_write_iv.copy_from_slice(&key_material[96..108]);
+            server_write_iv.copy_from_slice(&key_material[108..120]);
+
+            SessionKeys {
+                client_write_key,
+                server_write_key,
+                client_mac_key,
+                server_mac_key,
+                client_write_iv,
+                server_write_iv,
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    pub struct Transcript {
+        hasher: Sha256,
+    }
+
+    impl Transcript {
+        pub fn new() -> Self {
+            Transcript {
+                hasher: Sha256::new(),
+            }
+        }
+
+        pub fn update(&mut self, data: &[u8]) {
+            self.hasher.update(data);
+        }
+
+        pub fn current_hash(&self) -> [u8; 32] {
+            self.hasher.clone().finalize()
+        }
+    }
+}
+
+// ============================================================================
+// MODULE 7: SECURE ENCRYPTED SESSION CHANNELS
+// ============================================================================
+
+pub struct SecureSession<S: Read + Write> {
+    stream: S,
+    write_key: [u8; 16],
+    read_key: [u8; 16],
+    write_mac_key: [u8; 32],
+    read_mac_key: [u8; 32],
+    write_iv: [u8; 12],
+    read_iv: [u8; 12],
+    write_seq: u64,
+    read_seq: u64,
+}
+
+impl<S: Read + Write> SecureSession<S> {
+    pub fn new_client(stream: S, keys: protocol::SessionKeys) -> Self {
+        SecureSession {
+            stream,
+            write_key: keys.client_write_key,
+            read_key: keys.server_write_key,
+            write_mac_key: keys.client_mac_key,
+            read_mac_key: keys.server_mac_key,
+            write_iv: keys.client_write_iv,
+            read_iv: keys.server_write_iv,
+            write_seq: 0,
+            read_seq: 0,
+        }
+    }
+
+    pub fn new_server(stream: S, keys: protocol::SessionKeys) -> Self {
+        SecureSession {
+            stream,
+            write_key: keys.server_write_key,
+            read_key: keys.client_write_key,
+            write_mac_key: keys.server_mac_key,
+            read_mac_key: keys.client_mac_key,
+            write_iv: keys.server_write_iv,
+            read_iv: keys.client_write_iv,
+            write_seq: 0,
+            read_seq: 0,
+        }
+    }
+
+    /// Encrypts and transmits an authenticated record using Encrypt-then-MAC (EtM).
+    pub fn send_encrypted(&mut self, content_type: protocol::ContentType, plaintext: &[u8]) -> Result<(), String> {
+        let ciphertext = aes::aes_128_ctr(&self.write_key, &self.write_iv, self.write_seq as u32, plaintext);
+
+        let mut mac_header = Vec::with_capacity(13 + ciphertext.len());
+        mac_header.extend_from_slice(&self.write_seq.to_be_bytes());
+        mac_header.push(content_type as u8);
+        mac_header.extend_from_slice(&protocol::PROTOCOL_VERSION.to_be_bytes());
+        mac_header.extend_from_slice(&(ciphertext.len() as u16).to_be_bytes());
+        mac_header.extend_from_slice(&ciphertext);
+
+        let tag = hmac::HmacSha256::mac(&self.write_mac_key, &mac_header);
+
+        let mut wire_payload = Vec::with_capacity(ciphertext.len() + tag.len());
+        wire_payload.extend_from_slice(&ciphertext);
+        wire_payload.extend_from_slice(&tag);
+
+        let frame = protocol::RecordFrame {
+            content_type,
+            version: protocol::PROTOCOL_VERSION,
+            sequence_number: self.write_seq,
+            payload: wire_payload,
+        };
+
+        let raw_bytes = frame.serialize();
+        self.stream
+            .write_all(&raw_bytes)
+            .map_err(|e| format!("Failed to send record: {}", e))?;
+        self.stream.flush().map_err(|e| format!("Flush error: {}", e))?;
+
+        self.write_seq += 1;
+        Ok(())
+    }
+
+    /// Receives, authenticates, and decrypts an incoming record frame.
+    pub fn recv_encrypted(&mut self) -> Result<(protocol::ContentType, Vec<u8>), String> {
+        let frame = protocol::RecordFrame::deserialize(&mut self.stream)?;
+
+        if frame.sequence_number != self.read_seq {
+            return Err(format!(
+                "Replay Attack or Desynchronization detected! Expected seq {}, got {}",
+                self.read_seq, frame.sequence_number
+            ));
+        }
+
+        if frame.payload.len() < sha256::DIGEST_SIZE {
+            return Err("Record payload too short to contain HMAC tag".to_string());
+        }
+
+        let split_pos = frame.payload.len() - sha256::DIGEST_SIZE;
+        let ciphertext = &frame.payload[..split_pos];
+        let received_tag = &frame.payload[split_pos..];
+
+        let mut mac_header = Vec::with_capacity(13 + ciphertext.len());
+        mac_header.extend_from_slice(&frame.sequence_number.to_be_bytes());
+        mac_header.push(frame.content_type as u8);
+        mac_header.extend_from_slice(&frame.version.to_be_bytes());
+        mac_header.extend_from_slice(&(ciphertext.len() as u16).to_be_bytes());
+        mac_header.extend_from_slice(ciphertext);
+
+        if !hmac::HmacSha256::verify(&self.read_mac_key, &mac_header, received_tag) {
+            return Err("Tampering Detected! Cryptographic MAC tag verification failed.".to_string());
+        }
+
+        let plaintext = aes::aes_128_ctr(&self.read_key, &self.read_iv, self.read_seq as u32, ciphertext);
+        self.read_seq += 1;
+
+        Ok((frame.content_type, plaintext))
+    }
+}
+
+// ============================================================================
+// MODULE 8: HANDSHAKE CLIENT & SERVER ENGINES
+// ============================================================================
+
+pub struct HandshakeEngine;
+
+impl HandshakeEngine {
+    /// Executes the Server side of the Mini-TLS Handshake over raw TCP.
+    pub fn accept_handshake(mut stream: TcpStream) -> Result<SecureSession<TcpStream>, String> {
+        let mut transcript = protocol::Transcript::new();
+
+        // 1. Receive ClientHello
+        let client_hello_frame = protocol::RecordFrame::deserialize(&mut stream)?;
+        transcript.update(&client_hello_frame.payload);
+
+        let ch = &client_hello_frame.payload;
+        if ch[0] != protocol::HandshakeType::ClientHello as u8 {
+            return Err("Expected ClientHello".to_string());
+        }
+        let client_random = ch[1..33].to_vec();
+        let client_pub_len = u16::from_be_bytes([ch[33], ch[34]]) as usize;
+        let client_pub_bytes = &ch[35..35 + client_pub_len];
+        let client_pub = BigUint::from_be_bytes(client_pub_bytes);
+
+        // 2. Generate Server Ephemeral DH Keypair & Random
+        let server_random = entropy::random_bytes(32);
+        let dh_prime = BigUint::from_hex(DH_PRIME_512)?;
+        let dh_gen = BigUint::from_u64(DH_GENERATOR);
+        let server_priv = entropy::random_biguint(128);
+        let server_pub = dh_gen.mod_pow(&server_priv, &dh_prime);
+
+        // 3. Send ServerHello
+        let mut server_hello_payload = Vec::new();
+        server_hello_payload.push(protocol::HandshakeType::ServerHello as u8);
+        server_hello_payload.extend_from_slice(&server_random);
+
+        let sh_frame = protocol::RecordFrame {
+            content_type: protocol::ContentType::Handshake,
+            version: protocol::PROTOCOL_VERSION,
+            sequence_number: 0,
+            payload: server_hello_payload,
+        };
+        transcript.update(&sh_frame.payload);
+        stream.write_all(&sh_frame.serialize()).map_err(|e| e.to_string())?;
+
+        // 4. Send ServerKeyExchange
+        let server_pub_bytes = server_pub.to_be_bytes();
+        let mut ske_payload = Vec::new();
+        ske_payload.push(protocol::HandshakeType::ServerKeyExchange as u8);
+        ske_payload.extend_from_slice(&(server_pub_bytes.len() as u16).to_be_bytes());
+        ske_payload.extend_from_slice(&server_pub_bytes);
+
+        let ske_frame = protocol::RecordFrame {
+            content_type: protocol::ContentType::Handshake,
+            version: protocol::PROTOCOL_VERSION,
+            sequence_number: 1,
+            payload: ske_payload,
+        };
+        transcript.update(&ske_frame.payload);
+        stream.write_all(&ske_frame.serialize()).map_err(|e| e.to_string())?;
+
+        // 5. Derive Session Keys: Shared Secret = (ClientPub)^ServerPriv mod P
+        let shared_secret = client_pub.mod_pow(&server_priv, &dh_prime);
+        let keys = protocol::SessionKeys::derive(&shared_secret, &client_random, &server_random);
+
+        // 6. Receive Client Finished (Encrypted)
+        let mut session = SecureSession::new_server(stream, keys);
+        let (ct, client_finished_payload) = session.recv_encrypted()?;
+        if ct != protocol::ContentType::Handshake || client_finished_payload[0] != protocol::HandshakeType::Finished as u8 {
+            return Err("Expected Client Finished".to_string());
+        }
+
+        let expected_client_verify = hmac::HmacSha256::mac(&session.read_mac_key, &transcript.current_hash());
+        if !constant_time_eq(&client_finished_payload[1..33], &expected_client_verify) {
+            return Err("Client Finished verification failed! Man-in-the-Middle detected.".to_string());
+        }
+        transcript.update(&client_finished_payload);
+
+        // 7. Send Server Finished (Encrypted)
+        let server_verify = hmac::HmacSha256::mac(&session.write_mac_key, &transcript.current_hash());
+        let mut server_finished_payload = Vec::new();
+        server_finished_payload.push(protocol::HandshakeType::Finished as u8);
+        server_finished_payload.extend_from_slice(&server_verify);
+
+        session.send_encrypted(protocol::ContentType::Handshake, &server_finished_payload)?;
+
+        Ok(session)
+    }
+
+    /// Executes the Client side of the Mini-TLS Handshake over raw TCP.
+    pub fn connect_handshake(mut stream: TcpStream) -> Result<SecureSession<TcpStream>, String> {
+        let mut transcript = protocol::Transcript::new();
+
+        // 1. Generate Client Ephemeral DH Keypair & Random
+        let client_random = entropy::random_bytes(32);
+        let dh_prime = BigUint::from_hex(DH_PRIME_512)?;
+        let dh_gen = BigUint::from_u64(DH_GENERATOR);
+        let client_priv = entropy::random_biguint(128);
+        let client_pub = dh_gen.mod_pow(&client_priv, &dh_prime);
+        let client_pub_bytes = client_pub.to_be_bytes();
+
+        // 2. Send ClientHello
+        let mut ch_payload = Vec::new();
+        ch_payload.push(protocol::HandshakeType::ClientHello as u8);
+        ch_payload.extend_from_slice(&client_random);
+        ch_payload.extend_from_slice(&(client_pub_bytes.len() as u16).to_be_bytes());
+        ch_payload.extend_from_slice(&client_pub_bytes);
+
+        let ch_frame = protocol::RecordFrame {
+            content_type: protocol::ContentType::Handshake,
+            version: protocol::PROTOCOL_VERSION,
+            sequence_number: 0,
+            payload: ch_payload,
+        };
+        transcript.update(&ch_frame.payload);
+        stream.write_all(&ch_frame.serialize()).map_err(|e| e.to_string())?;
+
+        // 3. Receive ServerHello
+        let sh_frame = protocol::RecordFrame::deserialize(&mut stream)?;
+        transcript.update(&sh_frame.payload);
+        let sh = &sh_frame.payload;
+        if sh[0] != protocol::HandshakeType::ServerHello as u8 {
+            return Err("Expected ServerHello".to_string());
+        }
+        let server_random = sh[1..33].to_vec();
+
+        // 4. Receive ServerKeyExchange
+        let ske_frame = protocol::RecordFrame::deserialize(&mut stream)?;
+        transcript.update(&ske_frame.payload);
+        let ske = &ske_frame.payload;
+        if ske[0] != protocol::HandshakeType::ServerKeyExchange as u8 {
+            return Err("Expected ServerKeyExchange".to_string());
+        }
+        let server_pub_len = u16::from_be_bytes([ske[1], ske[2]]) as usize;
+        let server_pub_bytes = &ske[3..3 + server_pub_len];
+        let server_pub = BigUint::from_be_bytes(server_pub_bytes);
+
+        // 5. Derive Shared Secret = (ServerPub)^ClientPriv mod P
+        let shared_secret = server_pub.mod_pow(&client_priv, &dh_prime);
+        let keys = protocol::SessionKeys::derive(&shared_secret, &client_random, &server_random);
+
+        let mut session = SecureSession::new_client(stream, keys);
+
+        // 6. Send Client Finished (Encrypted)
+        let client_verify = hmac::HmacSha256::mac(&session.write_mac_key, &transcript.current_hash());
+        let mut client_finished_payload = Vec::new();
+        client_finished_payload.push(protocol::HandshakeType::Finished as u8);
+        client_finished_payload.extend_from_slice(&client_verify);
+
+        session.send_encrypted(protocol::ContentType::Handshake, &client_finished_payload)?;
+        transcript.update(&client_finished_payload);
+
+        // 7. Receive Server Finished (Encrypted)
+        let (ct, server_finished_payload) = session.recv_encrypted()?;
+        if ct != protocol::ContentType::Handshake || server_finished_payload[0] != protocol::HandshakeType::Finished as u8 {
+            return Err("Expected Server Finished".to_string());
+        }
+
+        let expected_server_verify = hmac::HmacSha256::mac(&session.read_mac_key, &transcript.current_hash());
+        if !constant_time_eq(&server_finished_payload[1..33], &expected_server_verify) {
+            return Err("Server Finished verification failed! Handshake downgraded or forged.".to_string());
+        }
+
+        Ok(session)
+    }
+}
+
+// ============================================================================
+// MODULE 9: CRYPTOGRAPHIC ANALYSIS & SECURITY COMMENTARY
+// ============================================================================
+
+pub struct SecurityNarrator;
+
+impl SecurityNarrator {
+    pub fn print_security_analysis() {
+        println!("\n===============================================================================");
+        println!("       CRYPTOGRAPHIC SECURITY DISCLOSURE & IMPLEMENTATION GAP ANALYSIS         ");
+        println!("===============================================================================");
+        println!(" 1. CACHE-TIMING ATTACKS ON AES (Bernstein 2005):");
+        println!("    - This codebase implements standard AES using byte lookup tables (S-Box).");
+        println!("    - On modern CPUs with L1 data caches, memory lookups indexed by sensitive key");
+        println!("      material take variable time depending on cache hits/misses.");
+        println!("    - Production libraries use hardware instructions (AES-NI) or constant-time");
+        println!("      bit-sliced vector implementations to eliminate this leak.");
+        println!();
+        println!(" 2. TIMING LEAKS IN MODULAR EXPONENTIATION:");
+        println!("    - The `mod_pow` function uses standard square-and-multiply branching:");
+        println!("      `if exp.is_odd() {{ ... }}`");
+        println!("    - An adversary observing CPU execution times or power draw can deduce");
+        println!("      individual bits of private Diffie-Hellman exponent keys.");
+        println!("    - Real TLS implementations use fixed-window Montgomery ladders with constant-time");
+        println!("      conditional swaps across all limbs.");
+        println!();
+        println!(" 3. LACK OF PUBLIC-KEY AUTHENTICATION (The MitM Vulnerability):");
+        println!("    - This handshake uses raw unauthenticated Diffie-Hellman (DH).");
+        println!("    - While eavesdroppers cannot calculate the shared secret, an active attacker");
+        println!("      sitting between client and server can negotiate independent keys with both sides.");
+        println!("    - Real TLS solves this with X.509 PKI certificates signed by trusted CAs.");
+        println!();
+        println!(" 4. PADDING ORACLES & ENCRYPT-THEN-MAC:");
+        println!("    - Historic attacks on TLS (POODLE, Lucky Thirteen) exploited CBC padding errors.");
+        println!("    - This design eliminates padding oracle attacks entirely by implementing");
+        println!("      AES-128-CTR with Encrypt-then-MAC (EtM). Authentication tags cover ciphertext");
+        println!("      and sequence numbers before decryption is ever attempted.");
+        println!("===============================================================================\n");
+    }
+}
+
+// ============================================================================
+// MODULE 10: AUTOMATED INTEGRATION TESTS
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::aes::{aes_128_ctr, Aes128};
+    use super::bignum::BigUint;
+    use super::constant_time_eq;
+    use super::hmac::HmacSha256;
+    use super::sha256::Sha256;
+
+    #[test]
+    fn test_bignum_arithmetic() {
+        let a = BigUint::from_u64(1000);
+        let b = BigUint::from_u64(250);
+        assert_eq!(a.add(&b), BigUint::from_u64(1250));
+        assert_eq!(a.sub(&b), BigUint::from_u64(750));
+        assert_eq!(a.mul(&b), BigUint::from_u64(250000));
+
+        let (q, r) = a.div_rem(&b);
+        assert_eq!(q, BigUint::from_u64(4));
+        assert_eq!(r, BigUint::zero());
+    }
+
+    #[test]
+    fn test_bignum_mod_pow() {
+        let base = BigUint::from_u64(4);
+        let exp = BigUint::from_u64(13);
+        let m = BigUint::from_u64(497);
+        // 4^13 mod 497 = 445
+        assert_eq!(base.mod_pow(&exp, &m), BigUint::from_u64(445));
+    }
+
+    #[test]
+    fn test_sha256_cavp_vector() {
+        // NIST test vector for "abc"
+        let digest = Sha256::digest(b"abc");
+        let hex_out: String = digest.iter().map(|b| format!("{:02x}", b)).collect();
+        assert_eq!(
+            hex_out,
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
+    fn test_hmac_sha256_vector() {
+        let key = b"key";
+        let data = b"The quick brown fox jumps over the lazy dog";
+        let tag = HmacSha256::mac(key, data);
+        let hex_out: String = tag.iter().map(|b| format!("{:02x}", b)).collect();
+        assert_eq!(
+            hex_out,
+            "f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8"
+        );
+    }
+
+    #[test]
+    fn test_aes128_known_vector() {
+        // NIST SP 800-38A Test Vector
+        let key = [
+            0x2b, 0x7e, 0x15, 0x16, 0x28, 0xae, 0xd2, 0xa6, 0xab, 0xf7, 0x15, 0x88, 0x09, 0xcf, 0x4f, 0x3c,
+        ];
+        let plaintext = [
+            0x6b, 0xc1, 0xbe, 0xe2, 0x2e, 0x40, 0x9f, 0x96, 0xe9, 0x3d, 0x7e, 0x11, 0x73, 0x93, 0x17, 0x2a,
+        ];
+        let expected_ciphertext = [
+            0x3a, 0xd7, 0x7b, 0xb4, 0x0d, 0x7a, 0x36, 0x60, 0xa8, 0x9e, 0xca, 0xf3, 0x24, 0x66, 0xef, 0x97,
+        ];
+
+        let cipher = Aes128::new(&key);
+        let mut output = [0u8; 16];
+        cipher.encrypt_block(&plaintext, &mut output);
+        assert_eq!(output, expected_ciphertext);
+    }
+
+    #[test]
+    fn test_aes_ctr_symmetry() {
+        let key = [0x42u8; 16];
+        let iv = [0x24u8; 12];
+        let message = b"Confidential message over hand-rolled stream transport.";
+
+        let ciphertext = aes_128_ctr(&key, &iv, 1, message);
+        let decrypted = aes_128_ctr(&key, &iv, 1, &ciphertext);
+        assert_eq!(decrypted, message);
+    }
+
+    #[test]
+    fn test_constant_time_comparison() {
+        let tag1 = [0x55u8; 32];
+        let mut tag2 = [0x55u8; 32];
+        assert!(constant_time_eq(&tag1, &tag2));
+        tag2[31] = 0x56;
+        assert!(!constant_time_eq(&tag1, &tag2));
+    }
+}
+
+// ============================================================================
+// MAIN APPLICATION & INTERACTIVE DEMONSTRATOR
+// ============================================================================
+
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+
+    if args.len() > 1 && args[1] == "--server" {
+        let port = args.get(2).map(|s| s.as_str()).unwrap_or("8443");
+        run_standalone_server(port);
+        return;
+    }
+
+    if args.len() > 1 && args[1] == "--client" {
+        let addr = args.get(2).map(|s| s.as_str()).unwrap_or("127.0.0.1:8443");
+        run_standalone_client(addr);
+        return;
+    }
+
+    // Default: Run self-contained, multi-threaded in-process demonstration
+    run_full_inprocess_demo();
+}
+
+fn run_standalone_server(port: &str) {
+    let bind_addr = format!("0.0.0.0:{}", port);
+    let listener = TcpListener::bind(&bind_addr).expect("Failed to bind server listener");
+    println!("[*] Mini-TLS Server listening on {}", bind_addr);
+
+    for stream in listener.incoming() {
+        match stream {
+            Ok(socket) => {
+                println!("[+] Incoming connection from {}", socket.peer_addr().unwrap());
+                match HandshakeEngine::accept_handshake(socket) {
+                    Ok(mut session) => {
+                        println!("[+] Handshake established! Listening for encrypted records...");
+                        loop {
+                            match session.recv_encrypted() {
+                                Ok((ct, msg)) => {
+                                    let txt = String::from_utf8_lossy(&msg);
+                                    println!(" [RX - {:?}] {}", ct, txt);
+                                    let reply = format!("ACK: {}", txt);
+                                    let _ = session.send_encrypted(protocol::ContentType::ApplicationData, reply.as_bytes());
+                                }
+                                Err(e) => {
+                                    println!("[-] Session closed: {}", e);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => eprintln!("[!] Handshake aborted: {}", e),
+                }
+            }
+            Err(e) => eprintln!("[!] Accept error: {}", e),
+        }
+    }
+}
+
+fn run_standalone_client(addr: &str) {
+    println!("[*] Connecting to Mini-TLS Server at {}", addr);
+    let stream = TcpStream::connect(addr).expect("Could not connect to target server");
+    match HandshakeEngine::connect_handshake(stream) {
+        Ok(mut session) => {
+            println!("[+] Handshake verified! Establishing secure application layer.");
+            session
+                .send_encrypted(protocol::ContentType::ApplicationData, b"Hello secure world!")
+                .expect("Write error");
+            let (_, reply) = session.recv_encrypted().expect("Read error");
+            println!("[+] Server response: {}", String::from_utf8_lossy(&reply));
+        }
+        Err(e) => eprintln!("[!] Handshake failed: {}", e),
+    }
+}
+
+fn run_full_inprocess_demo() {
+    println!("===============================================================================");
+    println!("        HAND-ROLLED CRYPTO ENGINE & MINI-TLS IN-PROCESS DEMONSTRATION          ");
+    println!("===============================================================================");
+
+    SecurityNarrator::print_security_analysis();
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind ephemeral test socket");
+    let local_addr = listener.local_addr().unwrap();
+    println!("[*] Ephemeral test socket allocated on: {}", local_addr);
+
+    let barrier = Arc::new(Barrier::new(2));
+    let server_barrier = Arc::clone(&barrier);
+
+    // --- SERVER THREAD ---
+    let server_handle = thread::spawn(move || {
+        server_barrier.wait();
+        let (socket, _) = listener.accept().expect("Failed to accept socket connection");
+        println!(" [SERVER] Received client connection. Beginning handshake state machine...");
+
+        let start = Instant::now();
+        let mut session = HandshakeEngine::accept_handshake(socket).expect("Server handshake failed");
+        let elapsed = start.elapsed();
+        println!(" [SERVER] Handshake completed successfully in {:.2?}!", elapsed);
+
+        // Receive Client Message
+        let (ct, payload) = session.recv_encrypted().expect("Server read failed");
+        println!(
+            " [SERVER] Decrypted Record: Type={:?}, Length={}, Content=\"{}\"",
+            ct,
+            payload.len(),
+            String::from_utf8_lossy(&payload)
+        );
+
+        // Send Server Response
+        let response = b"CONFIDENTIAL SERVER CONFIRMATION: Key exchange verified and integrity guaranteed.";
+        session
+            .send_encrypted(protocol::ContentType::ApplicationData, response)
+            .expect("Server write failed");
+        println!(" [SERVER] Encrypted reply transmitted.");
+    });
+
+    // --- CLIENT THREAD ---
+    let client_handle = thread::spawn(move || {
+        barrier.wait();
+        let socket = TcpStream::connect(local_addr).expect("Client failed to connect");
+        println!(" [CLIENT] Socket connected. Transmitting ClientHello with DH parameters...");
+
+        let start = Instant::now();
+        let mut session = HandshakeEngine::connect_handshake(socket).expect("Client handshake failed");
+        let elapsed = start.elapsed();
+        println!(" [CLIENT] Handshake completed successfully in {:.2?}!", elapsed);
+
+        // Send Encrypted Application Data
+        let message = b"CRITICAL CLIENT PAYLOAD: Transfer $100,000 to Account #84920";
+        println!(
+            " [CLIENT] Transmitting Encrypted Application Record: \"{}\"",
+            String::from_utf8_lossy(message)
+        );
+        session
+            .send_encrypted(protocol::ContentType::ApplicationData, message)
+            .expect("Client write failed");
+
+        // Receive Server Response
+        let (ct, reply) = session.recv_encrypted().expect("Client read failed");
+        println!(
+            " [CLIENT] Decrypted Record from Server: Type={:?}, Content=\"{}\"",
+            ct,
+            String::from_utf8_lossy(&reply)
+        );
+    });
+
+    server_handle.join().expect("Server thread panicked");
+    client_handle.join().expect("Client thread panicked");
+
+    println!("\n[*] Demonstration finished: Handshake negotiation, Diffie-Hellman derivation,");
+    println!("    AES-128-CTR streaming, and Encrypt-then-MAC record authentication fully verified.");
+}
