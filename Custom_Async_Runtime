@@ -1,0 +1,1052 @@
+//! # Custom Async Runtime from Scratch
+//!
+//! A complete, zero-dependency async runtime written entirely in standard Rust.
+//!
+//! Architectural Modules:
+//! 1. `waker`: Implementation of `std::task::Wake` for heap-allocated tasks.
+//! 2. `executor`: Multi-threaded worker pool that schedules and polls runnable tasks.
+//! 3. `timer_reactor`: Background reactor managing timed sleep deadlines.
+//! 4. `io_reactor`: Background reactor checking socket readiness for non-blocking I/O.
+//! 5. `primitives`: Async primitives including Sleep, Channels, Yield, Join, Race, and TCP.
+//! 6. `desugared`: Hand-coded state machine demonstrating compiler-level `async/await` lowering.
+//! 7. `main`: Diagnostic test suite showcasing concurrency, reactors, and I/O.
+
+use std::cmp::Ordering as CmpOrdering;
+use std::collections::{BinaryHeap, VecDeque};
+use std::future::Future;
+use std::io::{self, Read, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::task::{Context, Poll, Wake, Waker};
+use std::thread::{self, JoinHandle as ThreadJoinHandle};
+use std::time::{Duration, Instant};
+
+// ============================================================================
+// 1. TYPE ALIASES & TASK IDENTIFIERS
+// ============================================================================
+
+pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TaskId(pub u64);
+
+impl TaskId {
+    pub fn next() -> Self {
+        static COUNTER: AtomicU64 = AtomicU64::new(1);
+        TaskId(COUNTER.fetch_add(1, Ordering::Relaxed))
+    }
+}
+
+// ============================================================================
+// 2. TASK CORE & WAKER INTEGRATION
+// ============================================================================
+
+/// A scheduled unit of async execution.
+pub struct Task {
+    pub id: TaskId,
+    /// The top-level future being driven.
+    pub future: Mutex<Option<BoxFuture<'static, ()>>>,
+    /// Handle back to the scheduler queue to reschedule when awoken.
+    pub scheduler: Arc<TaskScheduler>,
+}
+
+impl Wake for Task {
+    /// Consuming wake: reschedules this task onto the executor.
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    /// Reference wake: avoids ref-count thrashing when re-waking.
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.scheduler.schedule(Arc::clone(self));
+    }
+}
+
+// ============================================================================
+// 3. SCHEDULER & MULTI-THREADED EXECUTOR
+// ============================================================================
+
+pub struct TaskScheduler {
+    run_queue: Mutex<VecDeque<Arc<Task>>>,
+    condvar: Condvar,
+    shutdown: AtomicBool,
+    active_tasks: AtomicUsize,
+}
+
+impl TaskScheduler {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            run_queue: Mutex::new(VecDeque::new()),
+            condvar: Condvar::new(),
+            shutdown: AtomicBool::new(false),
+            active_tasks: AtomicUsize::new(0),
+        })
+    }
+
+    pub fn schedule(&self, task: Arc<Task>) {
+        let mut queue = self.run_queue.lock().unwrap();
+        queue.push_back(task);
+        self.condvar.notify_one();
+    }
+
+    fn pop(&self) -> Option<Arc<Task>> {
+        let mut queue = self.run_queue.lock().unwrap();
+        loop {
+            if self.shutdown.load(Ordering::SeqCst) && queue.is_empty() {
+                return None;
+            }
+            if let Some(task) = queue.pop_front() {
+                return Some(task);
+            }
+            queue = self.condvar.wait(queue).unwrap();
+        }
+    }
+
+    pub fn stop(&self) {
+        self.shutdown.store(true, Ordering::SeqCst);
+        self.condvar.notify_all();
+    }
+}
+
+pub struct Runtime {
+    scheduler: Arc<TaskScheduler>,
+    worker_threads: Vec<ThreadJoinHandle<()>>,
+}
+
+impl Runtime {
+    pub fn new(num_workers: usize) -> Self {
+        let scheduler = TaskScheduler::new();
+        let mut worker_threads = Vec::with_capacity(num_workers);
+
+        for worker_id in 0..num_workers {
+            let sched = Arc::clone(&scheduler);
+            let handle = thread::Builder::new()
+                .name(format!("runtime-worker-{}", worker_id))
+                .spawn(move || {
+                    while let Some(task) = sched.pop() {
+                        let mut future_slot = task.future.lock().unwrap();
+                        if let Some(mut future) = future_slot.take() {
+                            let waker = Waker::from(Arc::clone(&task));
+                            let mut cx = Context::from_waker(&waker);
+
+                            drop(future_slot); // Release task lock before polling
+
+                            match future.as_mut().poll(&mut cx) {
+                                Poll::Pending => {
+                                    let mut slot = task.future.lock().unwrap();
+                                    *slot = Some(future);
+                                }
+                                Poll::Ready(()) => {
+                                    sched.active_tasks.fetch_sub(1, Ordering::SeqCst);
+                                }
+                            }
+                        }
+                    }
+                })
+                .expect("Failed to spawn runtime worker thread");
+
+            worker_threads.push(handle);
+        }
+
+        Self {
+            scheduler,
+            worker_threads,
+        }
+    }
+
+    /// Spawns an async future onto the runtime, returning a JoinHandle.
+    pub fn spawn<F, T>(&self, future: F) -> JoinHandle<T>
+    where
+        F: Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let task_id = TaskId::next();
+        let state = Arc::new(Mutex::new(TaskState {
+            result: None,
+            waker: None,
+        }));
+
+        let inner_state = Arc::clone(&state);
+        let wrapped_future = async move {
+            let val = future.await;
+            let mut guard = inner_state.lock().unwrap();
+            guard.result = Some(val);
+            if let Some(waker) = guard.waker.take() {
+                waker.wake();
+            }
+        };
+
+        let task = Arc::new(Task {
+            id: task_id,
+            future: Mutex::new(Some(Box::pin(wrapped_future))),
+            scheduler: Arc::clone(&self.scheduler),
+        });
+
+        self.scheduler.active_tasks.fetch_add(1, Ordering::SeqCst);
+        self.scheduler.schedule(task);
+
+        JoinHandle { state, task_id }
+    }
+
+    /// Blocks the current calling thread until the provided root future finishes.
+    pub fn block_on<F: Future>(&self, future: F) -> F::Output {
+        struct ThreadUnparker(thread::Thread);
+        impl Wake for ThreadUnparker {
+            fn wake(self: Arc<Self>) {
+                self.0.unpark();
+            }
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.unpark();
+            }
+        }
+
+        let waker = Waker::from(Arc::new(ThreadUnparker(thread::current())));
+        let mut cx = Context::from_waker(&waker);
+        let mut pinned = Box::pin(future);
+
+        loop {
+            match pinned.as_mut().poll(&mut cx) {
+                Poll::Ready(res) => return res,
+                Poll::Pending => thread::park(),
+            }
+        }
+    }
+
+    pub fn shutdown(self) {
+        self.scheduler.stop();
+        for worker in self.worker_threads {
+            let _ = worker.join();
+        }
+    }
+}
+
+static GLOBAL_RUNTIME: OnceLock<Runtime> = OnceLock::new();
+
+pub fn runtime() -> &'static Runtime {
+    GLOBAL_RUNTIME.get_or_init(|| Runtime::new(num_cpus()))
+}
+
+fn num_cpus() -> usize {
+    thread::available_parallelism().map(|n| n.get()).unwrap_or(4)
+}
+
+pub fn spawn<F, T>(future: F) -> JoinHandle<T>
+where
+    F: Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    runtime().spawn(future)
+}
+
+// ============================================================================
+// 4. JOIN HANDLE
+// ============================================================================
+
+struct TaskState<T> {
+    result: Option<T>,
+    waker: Option<Waker>,
+}
+
+pub struct JoinHandle<T> {
+    task_id: TaskId,
+    state: Arc<Mutex<TaskState<T>>>,
+}
+
+impl<T> JoinHandle<T> {
+    pub fn id(&self) -> TaskId {
+        self.task_id
+    }
+}
+
+impl<T> Future for JoinHandle<T> {
+    type Output = T;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let mut state = self.state.lock().unwrap();
+        if let Some(res) = state.result.take() {
+            Poll::Ready(res)
+        } else {
+            state.waker = Some(cx.waker().clone());
+            Poll::Pending
+        }
+    }
+}
+
+// ============================================================================
+// 5. TIMER REACTOR
+// ============================================================================
+
+struct TimerEntry {
+    deadline: Instant,
+    timer_id: u64,
+    waker: Waker,
+}
+
+impl PartialEq for TimerEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.deadline == other.deadline && self.timer_id == other.timer_id
+    }
+}
+impl Eq for TimerEntry {}
+
+impl PartialOrd for TimerEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<CmpOrdering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for TimerEntry {
+    fn cmp(&self, other: &Self) -> CmpOrdering {
+        other.deadline.cmp(&self.deadline)
+    }
+}
+
+pub struct TimerReactor {
+    timers: Mutex<BinaryHeap<TimerEntry>>,
+    condvar: Condvar,
+    shutdown: AtomicBool,
+}
+
+impl TimerReactor {
+    pub fn new() -> Arc<Self> {
+        let reactor = Arc::new(Self {
+            timers: Mutex::new(BinaryHeap::new()),
+            condvar: Condvar::new(),
+            shutdown: AtomicBool::new(false),
+        });
+
+        let reactor_clone = Arc::clone(&reactor);
+        thread::Builder::new()
+            .name("timer-reactor".into())
+            .spawn(move || reactor_clone.run())
+            .expect("Failed to spawn timer reactor");
+
+        reactor
+    }
+
+    pub fn register(&self, deadline: Instant, waker: Waker) {
+        static TIMER_SEQ: AtomicU64 = AtomicU64::new(1);
+        let timer_id = TIMER_SEQ.fetch_add(1, Ordering::Relaxed);
+
+        let mut timers = self.timers.lock().unwrap();
+        timers.push(TimerEntry {
+            deadline,
+            timer_id,
+            waker,
+        });
+        self.condvar.notify_one();
+    }
+
+    fn run(&self) {
+        let mut timers = self.timers.lock().unwrap();
+        while !self.shutdown.load(Ordering::SeqCst) {
+            let now = Instant::now();
+
+            while let Some(top) = timers.peek() {
+                if top.deadline <= now {
+                    let entry = timers.pop().unwrap();
+                    entry.waker.wake();
+                } else {
+                    break;
+                }
+            }
+
+            if let Some(top) = timers.peek() {
+                let dur = top.deadline.saturating_duration_since(now);
+                timers = self.condvar.wait_timeout(timers, dur).unwrap().0;
+            } else {
+                timers = self.condvar.wait(timers).unwrap();
+            }
+        }
+    }
+}
+
+static TIMER_REACTOR: OnceLock<Arc<TimerReactor>> = OnceLock::new();
+fn timer_reactor() -> &'static Arc<TimerReactor> {
+    TIMER_REACTOR.get_or_init(TimerReactor::new)
+}
+
+pub fn sleep(duration: Duration) -> SleepFuture {
+    SleepFuture {
+        deadline: Instant::now() + duration,
+        registered: false,
+    }
+}
+
+pub struct SleepFuture {
+    deadline: Instant,
+    registered: bool,
+}
+
+impl Future for SleepFuture {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        if Instant::now() >= this.deadline {
+            Poll::Ready(())
+        } else {
+            if !this.registered {
+                timer_reactor().register(this.deadline, cx.waker().clone());
+                this.registered = true;
+            }
+            Poll::Pending
+        }
+    }
+}
+
+// ============================================================================
+// 6. I/O REACTOR (NON-BLOCKING NETWORK POLLER)
+// ============================================================================
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IoInterest {
+    Readable,
+    Writable,
+}
+
+struct IoRegistration {
+    _fd_key: usize,
+    _interest: IoInterest,
+    waker: Waker,
+    check_fn: Arc<dyn Fn() -> bool + Send + Sync>,
+}
+
+pub struct IoReactor {
+    registrations: Mutex<Vec<IoRegistration>>,
+    condvar: Condvar,
+    shutdown: AtomicBool,
+}
+
+impl IoReactor {
+    pub fn new() -> Arc<Self> {
+        let reactor = Arc::new(Self {
+            registrations: Mutex::new(Vec::new()),
+            condvar: Condvar::new(),
+            shutdown: AtomicBool::new(false),
+        });
+
+        let clone = Arc::clone(&reactor);
+        thread::Builder::new()
+            .name("io-reactor".into())
+            .spawn(move || clone.poll_loop())
+            .expect("Failed to spawn IO reactor");
+
+        reactor
+    }
+
+    pub fn register(&self, reg: IoRegistration) {
+        let mut list = self.registrations.lock().unwrap();
+        list.push(reg);
+        self.condvar.notify_one();
+    }
+
+    fn poll_loop(&self) {
+        while !self.shutdown.load(Ordering::SeqCst) {
+            thread::sleep(Duration::from_millis(5));
+
+            let mut list = self.registrations.lock().unwrap();
+            if list.is_empty() {
+                list = self.condvar.wait(list).unwrap();
+            }
+
+            let mut still_pending = Vec::new();
+            for reg in list.drain(..) {
+                if (reg.check_fn)() {
+                    reg.waker.wake();
+                } else {
+                    still_pending.push(reg);
+                }
+            }
+            *list = still_pending;
+        }
+    }
+}
+
+static IO_REACTOR: OnceLock<Arc<IoReactor>> = OnceLock::new();
+fn io_reactor() -> &'static Arc<IoReactor> {
+    IO_REACTOR.get_or_init(IoReactor::new)
+}
+
+// ============================================================================
+// 7. ASYNC NETWORKING PRIMITIVES (TCP)
+// ============================================================================
+
+pub struct AsyncTcpListener {
+    raw: TcpListener,
+}
+
+impl AsyncTcpListener {
+    pub fn bind(addr: &str) -> io::Result<Self> {
+        let raw = TcpListener::bind(addr)?;
+        raw.set_nonblocking(true)?;
+        Ok(Self { raw })
+    }
+
+    pub fn accept(&self) -> AcceptFuture<'_> {
+        AcceptFuture { listener: self }
+    }
+}
+
+pub struct AcceptFuture<'a> {
+    listener: &'a AsyncTcpListener,
+}
+
+impl<'a> Future for AcceptFuture<'a> {
+    type Output = io::Result<(AsyncTcpStream, SocketAddr)>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        match self.listener.raw.accept() {
+            Ok((stream, addr)) => {
+                stream.set_nonblocking(true)?;
+                Poll::Ready(Ok((AsyncTcpStream { raw: stream }, addr)))
+            }
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                let raw_clone = self.listener.raw.try_clone().unwrap();
+                io_reactor().register(IoRegistration {
+                    _fd_key: 1,
+                    _interest: IoInterest::Readable,
+                    waker: cx.waker().clone(),
+                    check_fn: Arc::new(move || raw_clone.take_error().is_ok()),
+                });
+                Poll::Pending
+            }
+            Err(e) => Poll::Ready(Err(e)),
+        }
+    }
+}
+
+pub struct AsyncTcpStream {
+    raw: TcpStream,
+}
+
+impl AsyncTcpStream {
+    pub fn connect(addr: &str) -> ConnectFuture {
+        ConnectFuture {
+            addr: addr.to_string(),
+        }
+    }
+
+    pub fn read<'a>(&'a mut self, buf: &'a mut [u8]) -> ReadFuture<'a> {
+        ReadFuture { stream: self, buf }
+    }
+
+    pub fn write<'a>(&'a mut self, buf: &'a [u8]) -> WriteFuture<'a> {
+        WriteFuture { stream: self, buf }
+    }
+}
+
+pub struct ConnectFuture {
+    addr: String,
+}
+
+impl Future for ConnectFuture {
+    type Output = io::Result<AsyncTcpStream>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        match TcpStream::connect(&this.addr) {
+            Ok(s) => {
+                s.set_nonblocking(true)?;
+                Poll::Ready(Ok(AsyncTcpStream { raw: s }))
+            }
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+            Err(e) => Poll::Ready(Err(e)),
+        }
+    }
+}
+
+pub struct ReadFuture<'a> {
+    stream: &'a mut AsyncTcpStream,
+    buf: &'a mut [u8],
+}
+
+impl<'a> Future for ReadFuture<'a> {
+    type Output = io::Result<usize>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        let stream = &mut this.stream.raw;
+        let buf = &mut *this.buf;
+
+        match stream.read(buf) {
+            Ok(n) => Poll::Ready(Ok(n)),
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                let stream_clone = stream.try_clone().unwrap();
+                io_reactor().register(IoRegistration {
+                    _fd_key: 2,
+                    _interest: IoInterest::Readable,
+                    waker: cx.waker().clone(),
+                    check_fn: Arc::new(move || {
+                        let mut probe = [0u8; 1];
+                        match stream_clone.peek(&mut probe) {
+                            Ok(_) => true,
+                            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => false,
+                            Err(_) => true,
+                        }
+                    }),
+                });
+                Poll::Pending
+            }
+            Err(e) => Poll::Ready(Err(e)),
+        }
+    }
+}
+
+pub struct WriteFuture<'a> {
+    stream: &'a mut AsyncTcpStream,
+    buf: &'a [u8],
+}
+
+impl<'a> Future for WriteFuture<'a> {
+    type Output = io::Result<usize>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        let stream = &mut this.stream.raw;
+        let buf = this.buf;
+
+        match stream.write(buf) {
+            Ok(n) => Poll::Ready(Ok(n)),
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+            Err(e) => Poll::Ready(Err(e)),
+        }
+    }
+}
+
+// ============================================================================
+// 8. ASYNC CHANNELS (ACTOR / MESSAGE PASSING)
+// ============================================================================
+
+struct ChannelShared<T> {
+    queue: VecDeque<T>,
+    waiting_receiver: Option<Waker>,
+    closed: bool,
+}
+
+pub struct Sender<T> {
+    shared: Arc<Mutex<ChannelShared<T>>>,
+}
+
+pub struct Receiver<T> {
+    shared: Arc<Mutex<ChannelShared<T>>>,
+}
+
+pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
+    let shared = Arc::new(Mutex::new(ChannelShared {
+        queue: VecDeque::new(),
+        waiting_receiver: None,
+        closed: false,
+    }));
+
+    (
+        Sender {
+            shared: Arc::clone(&shared),
+        },
+        Receiver { shared },
+    )
+}
+
+impl<T> Sender<T> {
+    pub fn send(&self, item: T) -> Result<(), T> {
+        let mut guard = self.shared.lock().unwrap();
+        if guard.closed {
+            return Err(item);
+        }
+        guard.queue.push_back(item);
+        if let Some(waker) = guard.waiting_receiver.take() {
+            waker.wake();
+        }
+        Ok(())
+    }
+}
+
+impl<T> Drop for Sender<T> {
+    fn drop(&mut self) {
+        let mut guard = self.shared.lock().unwrap();
+        guard.closed = true;
+        if let Some(waker) = guard.waiting_receiver.take() {
+            waker.wake();
+        }
+    }
+}
+
+impl<T> Receiver<T> {
+    pub fn recv(&mut self) -> RecvFuture<'_, T> {
+        RecvFuture { receiver: self }
+    }
+}
+
+pub struct RecvFuture<'a, T> {
+    receiver: &'a mut Receiver<T>,
+}
+
+impl<'a, T> Future for RecvFuture<'a, T> {
+    type Output = Option<T>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let mut guard = self.receiver.shared.lock().unwrap();
+        if let Some(item) = guard.queue.pop_front() {
+            Poll::Ready(Some(item))
+        } else if guard.closed {
+            Poll::Ready(None)
+        } else {
+            guard.waiting_receiver = Some(cx.waker().clone());
+            Poll::Pending
+        }
+    }
+}
+
+// ============================================================================
+// 9. ASYNC COMBINATORS & COOPERATIVE YIELDING
+// ============================================================================
+
+pub fn yield_now() -> YieldFuture {
+    YieldFuture { yielded: false }
+}
+
+pub struct YieldFuture {
+    yielded: bool,
+}
+
+impl Future for YieldFuture {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        if this.yielded {
+            Poll::Ready(())
+        } else {
+            this.yielded = true;
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        }
+    }
+}
+
+struct JoinFuture<A: Future, B: Future> {
+    a: Pin<Box<A>>,
+    b: Pin<Box<B>>,
+    a_res: Option<A::Output>,
+    b_res: Option<B::Output>,
+}
+
+impl<A: Future, B: Future> Unpin for JoinFuture<A, B> {}
+
+impl<A: Future, B: Future> Future for JoinFuture<A, B> {
+    type Output = (A::Output, B::Output);
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+
+        if this.a_res.is_none() {
+            if let Poll::Ready(val) = this.a.as_mut().poll(cx) {
+                this.a_res = Some(val);
+            }
+        }
+        if this.b_res.is_none() {
+            if let Poll::Ready(val) = this.b.as_mut().poll(cx) {
+                this.b_res = Some(val);
+            }
+        }
+
+        if this.a_res.is_some() && this.b_res.is_some() {
+            let a_val = this.a_res.take().unwrap();
+            let b_val = this.b_res.take().unwrap();
+            Poll::Ready((a_val, b_val))
+        } else {
+            Poll::Pending
+        }
+    }
+}
+
+/// Awaits two futures concurrently, resolving when both complete.
+pub async fn join2<F1, F2>(f1: F1, f2: F2) -> (F1::Output, F2::Output)
+where
+    F1: Future,
+    F2: Future,
+{
+    JoinFuture {
+        a: Box::pin(f1),
+        b: Box::pin(f2),
+        a_res: None,
+        b_res: None,
+    }
+        .await
+}
+
+#[derive(Debug)]
+pub enum Either<A, B> {
+    Left(A),
+    Right(B),
+}
+
+struct RaceFuture<A: Future, B: Future> {
+    a: Pin<Box<A>>,
+    b: Pin<Box<B>>,
+}
+
+impl<A: Future, B: Future> Unpin for RaceFuture<A, B> {}
+
+impl<A: Future, B: Future> Future for RaceFuture<A, B> {
+    type Output = Either<A::Output, B::Output>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        if let Poll::Ready(v) = this.a.as_mut().poll(cx) {
+            return Poll::Ready(Either::Left(v));
+        }
+        if let Poll::Ready(v) = this.b.as_mut().poll(cx) {
+            return Poll::Ready(Either::Right(v));
+        }
+        Poll::Pending
+    }
+}
+
+/// Awaits two futures concurrently, returning the output of the first one to resolve.
+pub async fn race2<F1, F2>(f1: F1, f2: F2) -> Either<F1::Output, F2::Output>
+where
+    F1: Future,
+    F2: Future,
+{
+    RaceFuture {
+        a: Box::pin(f1),
+        b: Box::pin(f2),
+    }
+        .await
+}
+
+// ============================================================================
+// 10. MANUAL COMPILER DESUGARING DEMONSTRATION
+// ============================================================================
+
+/// Hand-written state machine matching compiler lowering of:
+/// ```text
+/// async fn compute(id: u32) -> u64 {
+///     let step1 = (id as u64) * 10;
+///     sleep(50ms).await;
+///     let step2 = step1 + 42;
+///     sleep(50ms).await;
+///     step2 * 2
+/// }
+/// ```
+pub enum DesugaredStateMachineFuture {
+    Start { id: u32 },
+    AwaitingSleep1 { step1: u64, sleep_fut: SleepFuture },
+    AwaitingSleep2 { step2: u64, sleep_fut: SleepFuture },
+    Done,
+}
+
+impl DesugaredStateMachineFuture {
+    pub fn new(id: u32) -> Self {
+        DesugaredStateMachineFuture::Start { id }
+    }
+}
+
+impl Future for DesugaredStateMachineFuture {
+    type Output = u64;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        loop {
+            match std::mem::replace(this, DesugaredStateMachineFuture::Done) {
+                DesugaredStateMachineFuture::Start { id } => {
+                    println!("  [DESUGAR STATE MACHINE] State: Start -> calculating step1");
+                    let step1 = (id as u64) * 10;
+                    let sleep_fut = sleep(Duration::from_millis(50));
+                    *this = DesugaredStateMachineFuture::AwaitingSleep1 { step1, sleep_fut };
+                }
+
+                DesugaredStateMachineFuture::AwaitingSleep1 {
+                    step1,
+                    mut sleep_fut,
+                } => {
+                    println!("  [DESUGAR STATE MACHINE] Polling Child Future: Sleep #1");
+                    match Pin::new(&mut sleep_fut).poll(cx) {
+                        Poll::Pending => {
+                            *this = DesugaredStateMachineFuture::AwaitingSleep1 { step1, sleep_fut };
+                            return Poll::Pending;
+                        }
+                        Poll::Ready(()) => {
+                            println!("  [DESUGAR STATE MACHINE] Child Sleep #1 Ready -> Transition to State 2");
+                            let step2 = step1 + 42;
+                            let next_sleep = sleep(Duration::from_millis(50));
+                            *this = DesugaredStateMachineFuture::AwaitingSleep2 {
+                                step2,
+                                sleep_fut: next_sleep,
+                            };
+                        }
+                    }
+                }
+
+                DesugaredStateMachineFuture::AwaitingSleep2 {
+                    step2,
+                    mut sleep_fut,
+                } => {
+                    println!("  [DESUGAR STATE MACHINE] Polling Child Future: Sleep #2");
+                    match Pin::new(&mut sleep_fut).poll(cx) {
+                        Poll::Pending => {
+                            *this = DesugaredStateMachineFuture::AwaitingSleep2 { step2, sleep_fut };
+                            return Poll::Pending;
+                        }
+                        Poll::Ready(()) => {
+                            println!("  [DESUGAR STATE MACHINE] Child Sleep #2 Ready -> Computing final result");
+                            *this = DesugaredStateMachineFuture::Done;
+                            return Poll::Ready(step2 * 2);
+                        }
+                    }
+                }
+
+                DesugaredStateMachineFuture::Done => {
+                    panic!("Polled future after completion!");
+                }
+            }
+        }
+    }
+}
+
+// ============================================================================
+// 11. DEMONSTRATION & VERIFICATION SUITE
+// ============================================================================
+
+fn main() {
+    println!("=================================================================");
+    println!("     STARTING ZERO-DEPENDENCY CUSTOM ASYNC RUNTIME               ");
+    println!("=================================================================");
+
+    let rt = runtime();
+
+    rt.block_on(async {
+        // DEMO 1: Explicit Compiler Desugaring
+        println!("\n>>> DEMO 1: Explicit Compiler Desugaring State Machine");
+        let manual_fut = DesugaredStateMachineFuture::new(5);
+        let res = manual_fut.await;
+        println!(">>> Desugared State Machine returned final computed value: {}\n", res);
+
+        // DEMO 2: Concurrent Timers on Multithreaded Executor
+        println!(">>> DEMO 2: Spawning Concurrent Timers on Multithreaded Executor");
+        let t1 = spawn(async {
+            println!("  [Task 1] started on thread: {:?}", thread::current().name());
+            sleep(Duration::from_millis(150)).await;
+            println!("  [Task 1] woke up after 150ms!");
+            1001
+        });
+
+        let t2 = spawn(async {
+            println!("  [Task 2] started on thread: {:?}", thread::current().name());
+            sleep(Duration::from_millis(50)).await;
+            println!("  [Task 2] woke up after 50ms!");
+            2002
+        });
+
+        let t3 = spawn(async {
+            println!("  [Task 3] started on thread: {:?}", thread::current().name());
+            sleep(Duration::from_millis(100)).await;
+            println!("  [Task 3] woke up after 100ms!");
+            3003
+        });
+
+        let (r1, r2, r3) = (t1.await, t2.await, t3.await);
+        println!(">>> All timed tasks joined with outputs: {}, {}, {}\n", r1, r2, r3);
+
+        // DEMO 3: Async Channel (Producer-Consumer)
+        println!(">>> DEMO 3: Async MPSC Channel (Producer-Consumer Tasks)");
+        let (tx, mut rx) = channel::<String>();
+
+        let producer = spawn(async move {
+            for i in 1..=4 {
+                sleep(Duration::from_millis(30)).await;
+                let msg = format!("Message #{}", i);
+                println!("  [Producer] Sent: {}", msg);
+                tx.send(msg).unwrap();
+            }
+            println!("  [Producer] Finished sending. Sender dropped.");
+        });
+
+        let consumer = spawn(async move {
+            let mut count = 0;
+            while let Some(msg) = rx.recv().await {
+                println!("  [Consumer] Received: {}", msg);
+                count += 1;
+            }
+            println!("  [Consumer] Channel closed. Total messages processed: {}", count);
+            count
+        });
+
+        let (_, count) = join2(producer, consumer).await;
+        println!(">>> Producer and Consumer completed successfully. Item count = {}\n", count);
+
+        // DEMO 4: Combinators (Race)
+        println!(">>> DEMO 4: Combinators (race2 and join2)");
+        let fast_task = async {
+            sleep(Duration::from_millis(20)).await;
+            "Fast Winner"
+        };
+        let slow_task = async {
+            sleep(Duration::from_millis(120)).await;
+            "Slow Loser"
+        };
+
+        match race2(fast_task, slow_task).await {
+            Either::Left(winner) => println!("  race2 winner: {}", winner),
+            Either::Right(winner) => println!("  race2 winner: {}", winner),
+        }
+
+        // DEMO 5: Non-blocking Async TCP Echo Server & Client
+        println!("\n>>> DEMO 5: Real Non-blocking Async TCP Network I/O");
+        let server_addr = "127.0.0.1:9095";
+        let listener = AsyncTcpListener::bind(server_addr).expect("Failed to bind TCP listener");
+
+        let server_task = spawn(async move {
+            println!("  [Server] Listening on {}", server_addr);
+            let (mut stream, addr) = listener.accept().await.expect("Accept failed");
+            println!("  [Server] Connection accepted from: {}", addr);
+
+            let mut buf = [0u8; 128];
+            let n = stream.read(&mut buf).await.expect("Read failed");
+            println!(
+                "  [Server] Read {} bytes: \"{}\"",
+                n,
+                String::from_utf8_lossy(&buf[..n])
+            );
+
+            stream.write(&buf[..n]).await.expect("Write failed");
+            println!("  [Server] Echoed back payload successfully.");
+        });
+
+        let client_task = spawn(async move {
+            sleep(Duration::from_millis(40)).await;
+            println!("  [Client] Connecting to {}", server_addr);
+            let mut stream = AsyncTcpStream::connect(server_addr)
+                .await
+                .expect("Client connect failed");
+
+            let payload = b"Hello from pure std Async Runtime!";
+            stream.write(payload).await.expect("Client write failed");
+            println!("  [Client] Sent payload: \"{}\"", String::from_utf8_lossy(payload));
+
+            let mut buf = [0u8; 128];
+            let n = stream.read(&mut buf).await.expect("Client read failed");
+            println!(
+                "  [Client] Received echo: \"{}\"",
+                String::from_utf8_lossy(&buf[..n])
+            );
+            assert_eq!(&buf[..n], payload);
+        });
+
+        join2(server_task, client_task).await;
+        println!("\n>>> Async TCP test completed with verified packet parity!");
+    });
+
+    println!("\n=================================================================");
+    println!("     ALL ASYNC RUNTIME TESTS PASSED SUCCESSFULLY!                ");
+    println!("=================================================================");
+}
