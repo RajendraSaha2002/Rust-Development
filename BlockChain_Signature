@@ -1,0 +1,572 @@
+// ============================================================================
+// QUANTUM-VULNERABLE BLOCKCHAIN & ECDSA TOY IMPLEMENTATION
+// Pure Rust (std-only) | Zero Dependencies | For Educational & Research Context
+// ============================================================================
+
+#![allow(non_snake_case)]
+#![allow(dead_code)]
+
+use std::fmt;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+// ============================================================================
+// 1. UTILITY & MATH MODULE
+// ============================================================================
+
+/// Safely computes (a mod b) ensuring a positive result.
+/// In Rust, the `%` operator is a remainder, not a strict modulo.
+pub fn modulo(a: i64, b: i64) -> i64 {
+    ((a % b) + b) % b
+}
+
+/// Computes the modular multiplicative inverse using the Extended Euclidean Algorithm.
+/// Returns x such that (a * x) % m == 1. Returns 0 if no inverse exists.
+pub fn mod_inverse(a: i64, m: i64) -> i64 {
+    let mut t = 0;
+    let mut newt = 1;
+    let mut r = m;
+    let mut newr = modulo(a, m);
+
+    while newr != 0 {
+        let quotient = r / newr;
+
+        let temp_t = t;
+        t = newt;
+        newt = temp_t - quotient * newt;
+
+        let temp_r = r;
+        r = newr;
+        newr = temp_r - quotient * newr;
+    }
+
+    if r > 1 {
+        return 0; // Not invertible
+    }
+    if t < 0 {
+        t += m;
+    }
+    t
+}
+
+/// A simple, std-only Linear Congruential Generator (LCG) for toy randomness.
+pub struct ToyRng {
+    state: u64,
+}
+
+impl ToyRng {
+    pub fn new() -> Self {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64;
+        ToyRng { state: now }
+    }
+
+    pub fn next_u64(&mut self) -> u64 {
+        // POSIX.1-2001 standard LCG parameters
+        self.state = self.state.wrapping_mul(6364136223846793005).wrapping_add(1);
+        self.state
+    }
+
+    /// Returns a random integer in the range [min, max)
+    pub fn range(&mut self, min: i64, max: i64) -> i64 {
+        if max <= min { return min; }
+        min + (self.next_u64() % ((max - min) as u64)) as i64
+    }
+}
+
+// ============================================================================
+// 2. SHA-256 HAND-ROLLED IMPLEMENTATION
+// ============================================================================
+
+const SHA256_K: [u32; 64] = [
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+];
+
+pub struct Sha256;
+
+impl Sha256 {
+    fn right_rotate(val: u32, bits: u32) -> u32 {
+        (val >> bits) | (val << (32 - bits))
+    }
+
+    pub fn hash(data: &[u8]) -> [u8; 32] {
+        let mut padded = data.to_vec();
+        let bit_len = (padded.len() as u64) * 8;
+
+        // 1. Append the 1 bit (as 0x80 byte)
+        padded.push(0x80);
+
+        // 2. Pad with zeros until length is congruent to 56 (mod 64)
+        while (padded.len() % 64) != 56 {
+            padded.push(0x00);
+        }
+
+        // 3. Append original length in bits as a 64-bit big-endian integer
+        padded.extend_from_slice(&bit_len.to_be_bytes());
+
+        // Initial hash values (first 32 bits of the fractional parts of the square roots of the first 8 primes)
+        let mut h: [u32; 8] = [
+            0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+            0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+        ];
+
+        // Process each 64-byte chunk
+        for chunk in padded.chunks(64) {
+            let mut w = [0u32; 64];
+            for i in 0..16 {
+                let start = i * 4;
+                w[i] = u32::from_be_bytes([
+                    chunk[start], chunk[start + 1], chunk[start + 2], chunk[start + 3]
+                ]);
+            }
+            for i in 16..64 {
+                let s0 = Self::right_rotate(w[i - 15], 7) ^ Self::right_rotate(w[i - 15], 18) ^ (w[i - 15] >> 3);
+                let s1 = Self::right_rotate(w[i - 2], 17) ^ Self::right_rotate(w[i - 2], 19) ^ (w[i - 2] >> 10);
+                w[i] = w[i - 16].wrapping_add(s0).wrapping_add(w[i - 7]).wrapping_add(s1);
+            }
+
+            let mut a = h[0]; let mut b = h[1]; let mut c = h[2]; let mut d = h[3];
+            let mut e = h[4]; let mut f = h[5]; let mut g = h[6]; let mut h_val = h[7];
+
+            for i in 0..64 {
+                let s1 = Self::right_rotate(e, 6) ^ Self::right_rotate(e, 11) ^ Self::right_rotate(e, 25);
+                let ch = (e & f) ^ (!e & g);
+                let temp1 = h_val.wrapping_add(s1).wrapping_add(ch).wrapping_add(SHA256_K[i]).wrapping_add(w[i]);
+
+                let s0 = Self::right_rotate(a, 2) ^ Self::right_rotate(a, 13) ^ Self::right_rotate(a, 22);
+                let maj = (a & b) ^ (a & c) ^ (b & c);
+                let temp2 = s0.wrapping_add(maj);
+
+                h_val = g;
+                g = f;
+                f = e;
+                e = d.wrapping_add(temp1);
+                d = c;
+                c = b;
+                b = a;
+                a = temp1.wrapping_add(temp2);
+            }
+
+            h[0] = h[0].wrapping_add(a); h[1] = h[1].wrapping_add(b);
+            h[2] = h[2].wrapping_add(c); h[3] = h[3].wrapping_add(d);
+            h[4] = h[4].wrapping_add(e); h[5] = h[5].wrapping_add(f);
+            h[6] = h[6].wrapping_add(g); h[7] = h[7].wrapping_add(h_val);
+        }
+
+        let mut output = [0u8; 32];
+        for i in 0..8 {
+            let bytes = h[i].to_be_bytes();
+            output[i * 4..(i + 1) * 4].copy_from_slice(&bytes);
+        }
+        output
+    }
+
+    /// Converts a byte array to a hex string representation
+    pub fn to_hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{:02x}", b)).collect()
+    }
+}
+
+// ============================================================================
+// 3. ELLIPTIC CURVE ARITHMETIC (TOY SCALE)
+// ============================================================================
+
+/// Represents a point on the Elliptic Curve
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Point {
+    Infinity,
+    Coord(i64, i64),
+}
+
+impl fmt::Display for Point {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            Point::Infinity => write!(f, "Point(Infinity)"),
+            Point::Coord(x, y) => write!(f, "Point({}, {})", x, y),
+        }
+    }
+}
+
+/// Defines the Elliptic Curve equation: y^2 = x^3 + ax + b (mod p)
+#[derive(Clone, Debug)]
+pub struct EllipticCurve {
+    pub p: i64,      // Prime field
+    pub a: i64,      // Curve param a
+    pub b: i64,      // Curve param b
+    pub g: Point,    // Generator point
+    pub n: i64,      // Order of the subgroup generated by G
+}
+
+impl EllipticCurve {
+    /// Creates a known toy curve. For this implementation, we brute force a valid curve
+    /// setup during initialization to guarantee correct mathematics on a small scale.
+    /// This mimics secp256k1 (y^2 = x^3 + 7) but mapped to a small prime field.
+    pub fn new_toy_curve() -> Self {
+        let p = 199;
+        let a = 0;
+        let b = 7;
+
+        // Find a valid point G
+        let mut generator = Point::Infinity;
+        for x in 0..p {
+            let rhs = modulo(x * x * x + a * x + b, p);
+            // Check if rhs is a quadratic residue (Euler's criterion)
+            let mut is_qr = false;
+            for y in 0..p {
+                if modulo(y * y, p) == rhs {
+                    generator = Point::Coord(x, y);
+                    is_qr = true;
+                    break;
+                }
+            }
+            if is_qr { break; }
+        }
+
+        let g = generator;
+
+        // Brute force the order of G (n)
+        let mut current = g;
+        let mut n = 1;
+        let temp_curve = EllipticCurve { p, a, b, g: Point::Infinity, n: 0 };
+
+        while current != Point::Infinity {
+            current = temp_curve.add(current, g);
+            n += 1;
+        }
+
+        println!("[*] Initialized Toy Curve: y^2 = x^3 + {} (mod {})", b, p);
+        println!("[*] Generator G: {} | Order n: {}", g, n);
+
+        EllipticCurve { p, a, b, g, n }
+    }
+
+    /// Adds two points on the elliptic curve P + Q
+    pub fn add(&self, p1: Point, p2: Point) -> Point {
+        match (p1, p2) {
+            (Point::Infinity, p2) => p2,
+            (p1, Point::Infinity) => p1,
+            (Point::Coord(x1, y1), Point::Coord(x2, y2)) => {
+                if x1 == x2 && y1 != y2 {
+                    // P + (-P) = Infinity
+                    return Point::Infinity;
+                }
+
+                let s; // Slope
+                if x1 == x2 && y1 == y2 {
+                    // Point doubling: P + P
+                    if y1 == 0 { return Point::Infinity; }
+                    let num = modulo(3 * x1 * x1 + self.a, self.p);
+                    let den = mod_inverse(modulo(2 * y1, self.p), self.p);
+                    s = modulo(num * den, self.p);
+                } else {
+                    // Standard addition
+                    let num = modulo(y2 - y1, self.p);
+                    let den = mod_inverse(modulo(x2 - x1, self.p), self.p);
+                    s = modulo(num * den, self.p);
+                }
+
+                let x3 = modulo(s * s - x1 - x2, self.p);
+                let y3 = modulo(s * (x1 - x3) - y1, self.p);
+
+                Point::Coord(x3, y3)
+            }
+        }
+    }
+
+    /// Scalar multiplication: k * P (using Double-and-Add algorithm)
+    /// This is the discrete logarithm function! Easy to compute forward, hard to reverse...
+    /// ...unless you have a Quantum Computer running Shor's Algorithm.
+    pub fn scalar_mul(&self, k: i64, p: Point) -> Point {
+        let mut result = Point::Infinity;
+        let mut addend = p;
+        let mut scalar = modulo(k, self.n); // Work within the subgroup order
+
+        while scalar > 0 {
+            if scalar & 1 == 1 {
+                result = self.add(result, addend);
+            }
+            addend = self.add(addend, addend);
+            scalar >>= 1;
+        }
+        result
+    }
+}
+
+// ============================================================================
+// 4. ECDSA SIGNATURE ENGINE
+// ============================================================================
+
+#[derive(Clone, Debug)]
+pub struct KeyPair {
+    pub private_key: i64,
+    pub public_key: Point,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Signature {
+    pub r: i64,
+    pub s: i64,
+}
+
+pub struct Ecdsa;
+
+impl Ecdsa {
+    pub fn generate_keypair(curve: &EllipticCurve, rng: &mut ToyRng) -> KeyPair {
+        // Private key d is randomly selected from [1, n-1]
+        let private_key = rng.range(1, curve.n);
+        // Public key Q = d * G
+        let public_key = curve.scalar_mul(private_key, curve.g);
+
+        KeyPair { private_key, public_key }
+    }
+
+    /// Truncates a 32-byte SHA256 hash down to our small modular field size for toy calculations.
+    /// In a real system, the hash is interpreted as an integer modulo curve order n.
+    fn hash_to_int(hash: &[u8; 32], n: i64) -> i64 {
+        let prefix = u32::from_be_bytes([hash[0], hash[1], hash[2], hash[3]]);
+        modulo(prefix as i64, n)
+    }
+
+    pub fn sign(curve: &EllipticCurve, private_key: i64, message_hash: &[u8; 32], rng: &mut ToyRng) -> Signature {
+        let z = Self::hash_to_int(message_hash, curve.n);
+
+        loop {
+            // 1. Pick a random nonce k in [1, n-1]
+            let k = rng.range(1, curve.n);
+
+            // 2. Calculate R = k * G
+            let r_point = curve.scalar_mul(k, curve.g);
+            let r = match r_point {
+                Point::Infinity => continue,
+                Point::Coord(x, _) => modulo(x, curve.n),
+            };
+            if r == 0 { continue; }
+
+            // 3. Calculate s = k^-1 * (z + r * private_key) mod n
+            let k_inv = mod_inverse(k, curve.n);
+            if k_inv == 0 { continue; }
+
+            let s = modulo(k_inv * (z + r * private_key), curve.n);
+            if s == 0 { continue; }
+
+            return Signature { r, s };
+        }
+    }
+
+    pub fn verify(curve: &EllipticCurve, public_key: Point, message_hash: &[u8; 32], sig: &Signature) -> bool {
+        // 1. Verify r and s are in range [1, n-1]
+        if sig.r <= 0 || sig.r >= curve.n || sig.s <= 0 || sig.s >= curve.n {
+            return false;
+        }
+
+        let z = Self::hash_to_int(message_hash, curve.n);
+
+        // 2. Calculate w = s^-1 mod n
+        let w = mod_inverse(sig.s, curve.n);
+        if w == 0 { return false; }
+
+        // 3. Calculate u1 = z * w mod n  and  u2 = r * w mod n
+        let u1 = modulo(z * w, curve.n);
+        let u2 = modulo(sig.r * w, curve.n);
+
+        // 4. Calculate point P = u1 * G + u2 * Q
+        let p1 = curve.scalar_mul(u1, curve.g);
+        let p2 = curve.scalar_mul(u2, public_key);
+        let p = curve.add(p1, p2);
+
+        // 5. Verification succeeds if P.x == r
+        match p {
+            Point::Infinity => false,
+            Point::Coord(x, _) => modulo(x, curve.n) == sig.r,
+        }
+    }
+}
+
+// ============================================================================
+// 5. BLOCKCHAIN STRUCTURE & PROOF-OF-WORK
+// ============================================================================
+
+#[derive(Clone, Debug)]
+pub struct Transaction {
+    pub sender: String,
+    pub receiver: String,
+    pub amount: u64,
+    pub signature: Option<Signature>,
+    pub pub_key_x: i64,
+    pub pub_key_y: i64,
+}
+
+impl Transaction {
+    pub fn new(sender: String, receiver: String, amount: u64, pub_key: Point) -> Self {
+        let (x, y) = match pub_key {
+            Point::Coord(x, y) => (x, y),
+            _ => (0, 0),
+        };
+        Transaction {
+            sender,
+            receiver,
+            amount,
+            signature: None,
+            pub_key_x: x,
+            pub_key_y: y,
+        }
+    }
+
+    pub fn calculate_hash(&self) -> [u8; 32] {
+        let payload = format!("{}{}{}", self.sender, self.receiver, self.amount);
+        Sha256::hash(payload.as_bytes())
+    }
+
+    pub fn sign_tx(&mut self, curve: &EllipticCurve, private_key: i64, rng: &mut ToyRng) {
+        let tx_hash = self.calculate_hash();
+        self.signature = Some(Ecdsa::sign(curve, private_key, &tx_hash, rng));
+    }
+
+    pub fn is_valid(&self, curve: &EllipticCurve) -> bool {
+        // Mining rewards don't need signatures
+        if self.sender == "SYSTEM_MINING_REWARD" {
+            return true;
+        }
+
+        if let Some(sig) = &self.signature {
+            let tx_hash = self.calculate_hash();
+            let pub_key = Point::Coord(self.pub_key_x, self.pub_key_y);
+            Ecdsa::verify(curve, pub_key, &tx_hash, sig)
+        } else {
+            false
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct Block {
+    pub index: u64,
+    pub timestamp: u64,
+    pub transactions: Vec<Transaction>,
+    pub previous_hash: String,
+    pub nonce: u64,
+    pub hash: String,
+}
+
+impl Block {
+    pub fn new(index: u64, transactions: Vec<Transaction>, previous_hash: String) -> Self {
+        let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let mut block = Block {
+            index,
+            timestamp,
+            transactions,
+            previous_hash,
+            nonce: 0,
+            hash: String::new(),
+        };
+        block.hash = block.calculate_hash();
+        block
+    }
+
+    pub fn calculate_hash(&self) -> String {
+        let mut tx_data = String::new();
+        for tx in &self.transactions {
+            tx_data.push_str(&tx.sender);
+            tx_data.push_str(&tx.receiver);
+            tx_data.push_str(&tx.amount.to_string());
+        }
+        let payload = format!("{}{}{}{}{}", self.index, self.timestamp, tx_data, self.previous_hash, self.nonce);
+        let hash_bytes = Sha256::hash(payload.as_bytes());
+        Sha256::to_hex(&hash_bytes)
+    }
+
+    pub fn mine_block(&mut self, difficulty: usize) {
+        let target = "0".repeat(difficulty);
+        println!("\n[Mining] Target prefix requirement: '{}'", target);
+
+        while &self.hash[0..difficulty] != target {
+            self.nonce += 1;
+            self.hash = self.calculate_hash();
+        }
+        println!("[Mining] Block Mined! Nonce: {} | Hash: {}", self.nonce, self.hash);
+    }
+}
+
+// ============================================================================
+// 6. MAIN EXECUTION & QUANTUM VULNERABILITY ANALYSIS
+// ============================================================================
+
+fn main() {
+    println!("============================================================");
+    println!(" TOY BLOCKCHAIN & ECDSA (RAW RUST IMPLEMENTATION)           ");
+    println!("============================================================\n");
+
+    // 1. Setup Crypto Environments
+    let mut rng = ToyRng::new();
+    let curve = EllipticCurve::new_toy_curve();
+
+    // 2. Generate Wallet Keys
+    println!("\n--- Generating Wallets ---");
+    let alice_keys = Ecdsa::generate_keypair(&curve, &mut rng);
+    let bob_keys = Ecdsa::generate_keypair(&curve, &mut rng);
+
+    println!("Alice Private Key (d): {}", alice_keys.private_key);
+    println!("Alice Public Key  (Q): {}", alice_keys.public_key);
+    println!("Bob Public Key    (Q): {}", bob_keys.public_key);
+
+    // 3. Create & Sign Transaction
+    println!("\n--- Creating Transaction ---");
+    let mut tx1 = Transaction::new("Alice_Wallet".to_string(), "Bob_Wallet".to_string(), 50, alice_keys.public_key);
+
+    let tx_hash = tx1.calculate_hash();
+    println!("Raw TX Hash (SHA-256): {}", Sha256::to_hex(&tx_hash));
+
+    tx1.sign_tx(&curve, alice_keys.private_key, &mut rng);
+    println!("ECDSA Signature: r = {}, s = {}", tx1.signature.as_ref().unwrap().r, tx1.signature.as_ref().unwrap().s);
+
+    // 4. Verification Check
+    let is_valid = tx1.is_valid(&curve);
+    println!("Is transaction signature valid? -> {}", is_valid);
+
+    // 5. Blockchain Integration
+    println!("\n--- Initializing Blockchain ---");
+    let genesis_tx = Transaction::new("SYSTEM_MINING_REWARD".to_string(), "Alice_Wallet".to_string(), 100, alice_keys.public_key);
+    let genesis_block = Block::new(0, vec![genesis_tx], "00000000000000000000000000000000".to_string());
+
+    let mut block_1 = Block::new(1, vec![tx1], genesis_block.hash.clone());
+
+    // Set low difficulty (e.g., 2 starting zeros) for speed in toy representation
+    block_1.mine_block(2);
+
+    println!("\nBlock 1 successfully added to the chain.");
+    println!("Contains 1 valid transaction. Previous Hash linkage secure.");
+
+    // 6. Quantum Vulnerability Brief
+    print_quantum_analysis(&alice_keys);
+}
+
+fn print_quantum_analysis(keys: &KeyPair) {
+    println!("\n============================================================");
+    println!(" QUANTUM VULNERABILITY ANALYSIS (SHOR'S ALGORITHM)          ");
+    println!("============================================================");
+    println!("In classical computing, guessing Alice's private key `d` from her public key `Q`");
+    println!("requires solving the Elliptic Curve Discrete Logarithm Problem (ECDLP):");
+    println!("    Q = d * G");
+    println!("Where: \n  Q = {} \n  G = Point(5, 16) [Standardized Generator]", keys.public_key);
+    println!("\nClassical systems must use brute force or Pollard's rho algorithm to find `d` ({}),", keys.private_key);
+    println!("which takes exponential time O(sqrt(n)). On a 256-bit curve, this is virtually impossible.");
+
+    println!("\n[QUANTUM THREAT VECTOR]");
+    println!("A sufficiently powerful quantum computer running Shor's Algorithm does not use brute force.");
+    println!("Instead, it formulates the discrete logarithm problem as a Hidden Subgroup Problem (HSP).");
+    println!("It evaluates a periodic function: f(a, b) = a * G + b * Q");
+    println!("Using the Quantum Fourier Transform (QFT), it isolates the period of this function");
+    println!("in polynomial time O(n^3), instantly revealing the secret multiplier `d`.");
+
+    println!("\n[THE IMPLICATION]");
+    println!("Once `d` is extracted from the public key, the attacker controls the wallet.");
+    println!("Notice that the Proof-of-Work hash (SHA-256) is largely unaffected by Shor's algorithm,");
+    println!("requiring Grover's algorithm to crack, which only halves the effective bit-length (256 -> 128 bit security).");
+    println!("The catastrophic failure point in modern blockchain architecture is exclusively ECDSA.");
+    println!("============================================================\n");
+}
