@@ -1,0 +1,507 @@
+
+
+#![allow(non_snake_case)]
+#![allow(dead_code)]
+
+use std::f64::consts::PI;
+use std::fs::File;
+use std::io::{Read, Write, BufReader, BufWriter};
+
+// ============================================================================
+// 1. COMPLEX NUMBER MATHEMATICS (No 'num-complex' crate)
+// ============================================================================
+
+#[derive(Clone, Copy, Debug)]
+pub struct Complex {
+    pub re: f64,
+    pub im: f64,
+}
+
+impl Complex {
+    pub fn new(re: f64, im: f64) -> Self {
+        Self { re, im }
+    }
+
+    pub fn from_polar(r: f64, theta: f64) -> Self {
+        Self {
+            re: r * theta.cos(),
+            im: r * theta.sin(),
+        }
+    }
+
+    pub fn magnitude(&self) -> f64 {
+        (self.re * self.re + self.im * self.im).sqrt()
+    }
+}
+
+impl std::ops::Add for Complex {
+    type Output = Complex;
+    fn add(self, other: Self) -> Self {
+        Complex::new(self.re + other.re, self.im + other.im)
+    }
+}
+
+impl std::ops::Sub for Complex {
+    type Output = Complex;
+    fn sub(self, other: Self) -> Self {
+        Complex::new(self.re - other.re, self.im - other.im)
+    }
+}
+
+impl std::ops::Mul for Complex {
+    type Output = Complex;
+    fn mul(self, other: Self) -> Self {
+        Complex::new(
+            self.re * other.re - self.im * other.im,
+            self.re * other.im + self.im * other.re,
+        )
+    }
+}
+
+// ============================================================================
+// 2. DIGITAL SIGNAL PROCESSING: FFT & FIR
+// ============================================================================
+
+/// In-place Cooley-Tukey Radix-2 Fast Fourier Transform (FFT)
+/// Input length MUST be a power of 2.
+pub fn fft_radix2(x: &mut [Complex]) {
+    let n = x.len();
+    if n <= 1 {
+        return;
+    }
+
+    // Check if power of 2
+    if n & (n - 1) != 0 {
+        panic!("FFT input length must be a power of 2");
+    }
+
+    // Bit-reverse copy
+    let mut j = 0;
+    for i in 1..n {
+        let mut bit = n >> 1;
+        while j & bit != 0 {
+            j ^= bit;
+            bit >>= 1;
+        }
+        j ^= bit;
+        if i < j {
+            x.swap(i, j);
+        }
+    }
+
+    // Cooley-Tukey iterative butterfly algorithm
+    let mut len = 2;
+    while len <= n {
+        let angle = -2.0 * PI / (len as f64);
+        let wlen = Complex::from_polar(1.0, angle);
+
+        for i in (0..n).step_by(len) {
+            let mut w = Complex::new(1.0, 0.0);
+            for j in 0..(len / 2) {
+                let u = x[i + j];
+                let v = x[i + j + len / 2] * w;
+                x[i + j] = u + v;
+                x[i + j + len / 2] = u - v;
+                w = w * wlen;
+            }
+        }
+        len *= 2;
+    }
+}
+
+/// Helper: Pad array to the next power of 2 for FFT
+pub fn pad_to_power_of_2(data: &[f64]) -> Vec<Complex> {
+    let mut power = 1;
+    while power < data.len() {
+        power *= 2;
+    }
+    let mut complex_data = Vec::with_capacity(power);
+    for &val in data {
+        complex_data.push(Complex::new(val, 0.0));
+    }
+    for _ in data.len()..power {
+        complex_data.push(Complex::new(0.0, 0.0));
+    }
+    complex_data
+}
+
+/// Finite Impulse Response (FIR) Filter
+pub struct FirFilter {
+    coefficients: Vec<f64>,
+}
+
+impl FirFilter {
+    /// Creates a basic Moving Average filter (Low-pass)
+    pub fn moving_average(window_size: usize) -> Self {
+        let coef = 1.0 / (window_size as f64);
+        Self {
+            coefficients: vec![coef; window_size],
+        }
+    }
+
+    /// Applies the convolution to the input signal
+    pub fn apply(&self, input: &[f64]) -> Vec<f64> {
+        let mut output = Vec::with_capacity(input.len());
+        let m = self.coefficients.len();
+
+        for i in 0..input.len() {
+            let mut sum = 0.0;
+            for j in 0..m {
+                if i >= j {
+                    sum += input[i - j] * self.coefficients[j];
+                }
+            }
+            output.push(sum);
+        }
+        output
+    }
+}
+
+// ============================================================================
+// 3. STA/LTA (SHORT-TERM / LONG-TERM AVERAGE) ALGORITHM
+// ============================================================================
+
+/// Detects seismic event arrivals (P-waves/S-waves).
+/// Returns a vector of STA/LTA ratios. A ratio spiking above a threshold (e.g. 4.0) indicates a trigger.
+pub fn sta_lta(data: &[f64], sta_len: usize, lta_len: usize) -> Vec<f64> {
+    if data.len() < lta_len {
+        panic!("Data length must be greater than LTA window");
+    }
+
+    let mut ratios = vec![0.0; data.len()];
+    let mut sta_sum = 0.0;
+    let mut lta_sum = 0.0;
+
+    // We use the absolute amplitude (or power) of the signal
+    let abs_data: Vec<f64> = data.iter().map(|x| x.abs()).collect();
+
+    // Initialize sums for the first LTA window
+    for i in 0..lta_len {
+        lta_sum += abs_data[i];
+        if i >= lta_len - sta_len {
+            sta_sum += abs_data[i];
+        }
+    }
+
+    ratios[lta_len - 1] = (sta_sum / sta_len as f64) / (lta_sum / lta_len as f64);
+
+    // Slide the window efficiently O(N)
+    for i in lta_len..data.len() {
+        // Update LTA sum
+        lta_sum += abs_data[i];
+        lta_sum -= abs_data[i - lta_len];
+
+        // Update STA sum
+        sta_sum += abs_data[i];
+        sta_sum -= abs_data[i - sta_len];
+
+        let sta_avg = sta_sum / (sta_len as f64);
+        let lta_avg = lta_sum / (lta_len as f64);
+
+        // Prevent division by zero
+        ratios[i] = if lta_avg > 1e-9 { sta_avg / lta_avg } else { 1.0 };
+    }
+
+    ratios
+}
+
+// ============================================================================
+// 4. CUSTOM BINARY FILE FORMAT & MOCK DATA GENERATOR
+// ============================================================================
+
+#[derive(Clone, Debug)]
+pub struct SeismicSample {
+    pub timestamp: u64, // Microseconds since epoch
+    pub amplitude: f64,
+}
+
+pub struct SeismicData {
+    pub sample_rate: f64,
+    pub samples: Vec<SeismicSample>,
+}
+
+impl SeismicData {
+    const MAGIC_HEADER: [u8; 4] = *b"SEIS";
+
+    /// Writes raw samples to our custom `.bin` format
+    pub fn write_to_binary(&self, filepath: &str) -> std::io::Result<()> {
+        let mut file = BufWriter::new(File::create(filepath)?);
+
+        // Write Header
+        file.write_all(&Self::MAGIC_HEADER)?;
+        file.write_all(&self.sample_rate.to_le_bytes())?;
+        file.write_all(&(self.samples.len() as u64).to_le_bytes())?;
+
+        // Write Payload
+        for sample in &self.samples {
+            file.write_all(&sample.timestamp.to_le_bytes())?;
+            file.write_all(&sample.amplitude.to_le_bytes())?;
+        }
+
+        Ok(())
+    }
+
+    /// Reads raw samples from our custom `.bin` format
+    pub fn read_from_binary(filepath: &str) -> std::io::Result<Self> {
+        let mut file = BufReader::new(File::open(filepath)?);
+
+        // Read & Verify Header
+        let mut magic = [0u8; 4];
+        file.read_exact(&mut magic)?;
+        if magic != Self::MAGIC_HEADER {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid magic number"));
+        }
+
+        let mut sr_bytes = [0u8; 8];
+        file.read_exact(&mut sr_bytes)?;
+        let sample_rate = f64::from_le_bytes(sr_bytes);
+
+        let mut len_bytes = [0u8; 8];
+        file.read_exact(&mut len_bytes)?;
+        let len = u64::from_le_bytes(len_bytes);
+
+        // Read Payload
+        let mut samples = Vec::with_capacity(len as usize);
+        for _ in 0..len {
+            let mut ts_bytes = [0u8; 8];
+            file.read_exact(&mut ts_bytes)?;
+
+            let mut amp_bytes = [0u8; 8];
+            file.read_exact(&mut amp_bytes)?;
+
+            samples.push(SeismicSample {
+                timestamp: u64::from_le_bytes(ts_bytes),
+                amplitude: f64::from_le_bytes(amp_bytes),
+            });
+        }
+
+        Ok(Self { sample_rate, samples })
+    }
+}
+
+/// Simple LCG for noise generation
+struct SimpleRng { state: u64 }
+impl SimpleRng {
+    fn new(seed: u64) -> Self { Self { state: seed } }
+    fn next_f64(&mut self) -> f64 {
+        self.state = self.state.wrapping_mul(6364136223846793005).wrapping_add(1);
+        let float_val = (self.state >> 11) as f64;
+        (float_val / (1u64 << 53) as f64) * 2.0 - 1.0 // Range [-1.0, 1.0]
+    }
+}
+
+/// Generates synthetic data featuring background noise, a P-wave (high freq), and S-wave (high amp)
+pub fn generate_mock_seismogram(sample_rate: f64, duration_sec: f64) -> SeismicData {
+    let mut rng = SimpleRng::new(12345);
+    let num_samples = (sample_rate * duration_sec) as usize;
+    let mut samples = Vec::with_capacity(num_samples);
+
+    // Timings
+    let p_wave_start = (num_samples as f64 * 0.3) as usize;
+    let s_wave_start = (num_samples as f64 * 0.45) as usize;
+
+    for i in 0..num_samples {
+        let t = i as f64 / sample_rate;
+        let timestamp = (t * 1_000_000.0) as u64; // Microseconds
+
+        // 1. Background micro-seismic noise
+        let mut amp = rng.next_f64() * 0.5;
+
+        // 2. Add P-wave (Primary, faster, higher frequency, lower amplitude)
+        if i > p_wave_start {
+            let p_t = (i - p_wave_start) as f64 / sample_rate;
+            let decay = (-p_t * 2.0).exp();
+            amp += (p_t * 2.0 * PI * 15.0).sin() * 3.0 * decay;
+        }
+
+        // 3. Add S-wave (Secondary, slower, lower frequency, higher amplitude)
+        if i > s_wave_start {
+            let s_t = (i - s_wave_start) as f64 / sample_rate;
+            let decay = (-s_t * 1.5).exp();
+            amp += (s_t * 2.0 * PI * 5.0).sin() * 8.0 * decay;
+        }
+
+        samples.push(SeismicSample { timestamp, amplitude: amp });
+    }
+
+    SeismicData { sample_rate, samples }
+}
+
+// ============================================================================
+// 5. PPM IMAGE PLOTTER (Hand-rolled Image Matrix)
+// ============================================================================
+
+#[derive(Clone, Copy)]
+struct Rgb(u8, u8, u8);
+
+struct PpmPlotter {
+    width: usize,
+    height: usize,
+    pixels: Vec<Rgb>,
+}
+
+impl PpmPlotter {
+    pub fn new(width: usize, height: usize) -> Self {
+        Self {
+            width,
+            height,
+            pixels: vec![Rgb(255, 255, 255); width * height],
+        }
+    }
+
+    fn set_pixel(&mut self, x: usize, y: usize, color: Rgb) {
+        if x < self.width && y < self.height {
+            // Y-axis inverted for standard graphics coords
+            let inverted_y = self.height - 1 - y;
+            self.pixels[inverted_y * self.width + x] = color;
+        }
+    }
+
+    /// Bresenham's Line Algorithm
+    pub fn draw_line(&mut self, mut x0: i32, mut y0: i32, x1: i32, y1: i32, color: Rgb) {
+        let dx = (x1 - x0).abs();
+        let sx = if x0 < x1 { 1 } else { -1 };
+        let dy = -(y1 - y0).abs();
+        let sy = if y0 < y1 { 1 } else { -1 };
+        let mut err = dx + dy;
+
+        loop {
+            if x0 >= 0 && x0 < self.width as i32 && y0 >= 0 && y0 < self.height as i32 {
+                self.set_pixel(x0 as usize, y0 as usize, color);
+            }
+            if x0 == x1 && y0 == y1 { break; }
+            let e2 = 2 * err;
+            if e2 >= dy { err += dy; x0 += sx; }
+            if e2 <= dx { err += dx; y0 += sy; }
+        }
+    }
+
+    pub fn write_to_file(&self, filename: &str) -> std::io::Result<()> {
+        let mut file = BufWriter::new(File::create(filename)?);
+        // P6 Binary PPM Format
+        writeln!(file, "P6\n{} {}\n255", self.width, self.height)?;
+        for pixel in &self.pixels {
+            file.write_all(&[pixel.0, pixel.1, pixel.2])?;
+        }
+        Ok(())
+    }
+}
+
+// ============================================================================
+// 6. MAIN PIPELINE INTEGRATION
+// ============================================================================
+
+fn main() {
+    println!("============================================================");
+    println!(" SEISMIC SIGNAL PROCESSOR (CUSTOM DSP PIPELINE)             ");
+    println!("============================================================\n");
+
+    let bin_file = "seismic_data.bin";
+    let csv_file = "analysis.csv";
+    let img_file = "seismogram.ppm";
+
+    // 1. Generate & Serialize
+    println!("[*] Generating 10 seconds of mock seismic data (100 Hz)...");
+    let synthetic_data = generate_mock_seismogram(100.0, 10.0);
+    synthetic_data.write_to_binary(bin_file).unwrap();
+    println!("    -> Saved binary to '{}'", bin_file);
+
+    // 2. Deserialize & Parse
+    println!("[*] Reading binary data back into memory...");
+    let data = SeismicData::read_from_binary(bin_file).unwrap();
+    let raw_amps: Vec<f64> = data.samples.iter().map(|s| s.amplitude).collect();
+
+    // 3. FIR Filtering
+    println!("[*] Applying FIR Low-Pass Filter (Window = 5)...");
+    let filter = FirFilter::moving_average(5);
+    let filtered_amps = filter.apply(&raw_amps);
+
+    // 4. STA/LTA Trigger Algorithm
+    println!("[*] Computing STA/LTA for Phase Picking...");
+    let sta_window = (data.sample_rate * 0.5) as usize; // 0.5 sec
+    let lta_window = (data.sample_rate * 3.0) as usize; // 3.0 sec
+    let sta_lta_ratios = sta_lta(&filtered_amps, sta_window, lta_window);
+
+    // Find the first major trigger (P-wave)
+    let trigger_threshold = 3.5;
+    let mut p_wave_idx = 0;
+    for (i, &ratio) in sta_lta_ratios.iter().enumerate() {
+        if ratio > trigger_threshold {
+            p_wave_idx = i;
+            break;
+        }
+    }
+    let p_wave_time = data.samples[p_wave_idx].timestamp as f64 / 1_000_000.0;
+    println!("    -> P-Wave Trigger Detected at {:.2} seconds!", p_wave_time);
+
+    // 5. Fast Fourier Transform (FFT) on the P-Wave Window
+    println!("[*] Running Cooley-Tukey Radix-2 FFT on the P-wave window...");
+    let fft_window_size = 128; // Analyze the immediate 128 samples after the trigger
+    let end_idx = (p_wave_idx + fft_window_size).min(filtered_amps.len());
+    let windowed_data = &filtered_amps[p_wave_idx..end_idx];
+
+    let mut fft_data = pad_to_power_of_2(windowed_data);
+    fft_radix2(&mut fft_data);
+
+    // Find dominant frequency index (ignoring the DC component at index 0)
+    let mut max_mag = 0.0;
+    let mut dom_idx = 0;
+    for i in 1..(fft_data.len() / 2) {
+        let mag = fft_data[i].magnitude();
+        if mag > max_mag {
+            max_mag = mag;
+            dom_idx = i;
+        }
+    }
+    let freq_resolution = data.sample_rate / fft_data.len() as f64;
+    let dominant_freq = dom_idx as f64 * freq_resolution;
+    println!("    -> Dominant frequency in P-wave: {:.2} Hz", dominant_freq);
+
+    // 6. Output to CSV
+    println!("[*] Exporting results to CSV...");
+    let mut csv = BufWriter::new(File::create(csv_file).unwrap());
+    writeln!(csv, "Timestamp_us,Raw_Amp,Filtered_Amp,STA_LTA_Ratio").unwrap();
+    for i in 0..data.samples.len() {
+        writeln!(csv, "{},{:.4},{:.4},{:.4}",
+                 data.samples[i].timestamp,
+                 raw_amps[i],
+                 filtered_amps[i],
+                 sta_lta_ratios[i]
+        ).unwrap();
+    }
+    println!("    -> Saved analysis to '{}'", csv_file);
+
+    // 7. Render PPM Image Plot
+    println!("[*] Rendering Seismogram PPM Plot...");
+    let img_w = 1000;
+    let img_h = 400;
+    let mut plotter = PpmPlotter::new(img_w, img_h);
+
+    let max_amp = raw_amps.iter().map(|a| a.abs()).fold(0.0f64, f64::max);
+    let scale_y = (img_h as f64 / 2.0) / (max_amp * 1.1); // 10% padding
+    let scale_x = img_w as f64 / raw_amps.len() as f64;
+
+    // Draw center line
+    plotter.draw_line(0, img_h as i32 / 2, img_w as i32, img_h as i32 / 2, Rgb(200, 200, 200));
+
+    for i in 1..raw_amps.len() {
+        let x0 = ((i - 1) as f64 * scale_x) as i32;
+        let y0 = ((raw_amps[i - 1] * scale_y) + (img_h as f64 / 2.0)) as i32;
+
+        let x1 = (i as f64 * scale_x) as i32;
+        let y1 = ((raw_amps[i] * scale_y) + (img_h as f64 / 2.0)) as i32;
+
+        // Draw Waveform (Blue)
+        plotter.draw_line(x0, y0, x1, y1, Rgb(0, 50, 200));
+
+        // Overlay STA/LTA threshold (Red markers) if triggered
+        if sta_lta_ratios[i] > trigger_threshold {
+            plotter.draw_line(x1, 0, x1, 10, Rgb(255, 0, 0));
+        }
+    }
+
+    plotter.write_to_file(img_file).unwrap();
+    println!("    -> Saved high-res plot to '{}'", img_file);
+
+    println!("\n[SUCCESS] Pipeline execution complete.");
+}
