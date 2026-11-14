@@ -1,0 +1,110 @@
+use crate::protocol::{FramedSocket, LogPayload, Packet};
+use std::process::Stdio;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::process::Command;
+use tokio::sync::Mutex;
+use tokio::time::timeout;
+
+pub struct ProcessExecutor;
+
+impl ProcessExecutor {
+    pub async fn execute(
+        socket: Arc<Mutex<FramedSocket>>,
+        job_id: String,
+        cmd: String,
+        args: Vec<String>,
+        timeout_ms: u64,
+        output_cap: usize,
+    ) -> i32 {
+        let mut child = match Command::new(&cmd)
+            .args(&args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                Self::send_log(socket, &job_id, "SYSTEM", &format!("Process Spawn Error: {}", e)).await;
+                return 127;
+            }
+        };
+
+        let stdout = child.stdout.take().expect("Failed opening stdout");
+        let stderr = child.stderr.take().expect("Failed opening stderr");
+
+        let s1 = socket.clone();
+        let j1 = job_id.clone();
+        let h_out = tokio::spawn(async move {
+            Self::stream_reader(stdout, s1, j1, "STDOUT".to_string(), output_cap).await;
+        });
+
+        let s2 = socket.clone();
+        let j2 = job_id.clone();
+        let h_err = tokio::spawn(async move {
+            Self::stream_reader(stderr, s2, j2, "STDERR".to_string(), output_cap).await;
+        });
+
+        let execution = async {
+            let status = child.wait().await;
+            let _ = tokio::join!(h_out, h_err);
+            status
+        };
+
+        match timeout(Duration::from_millis(timeout_ms), execution).await {
+            Ok(Ok(status)) => status.code().unwrap_or(1),
+            Ok(Err(e)) => {
+                Self::send_log(socket, &job_id, "SYSTEM", &format!("Execution Internal Failure: {}", e)).await;
+                1
+            }
+            Err(_) => {
+                Self::send_log(socket, &job_id, "SYSTEM", "TIMED OUT: Exceeded run deadline").await;
+                124 // Standard SIGALRM / timeout exit status code
+            }
+        }
+    }
+
+    async fn stream_reader<R: AsyncRead + Unpin>(
+        mut reader: R,
+        socket: Arc<Mutex<FramedSocket>>,
+        job_id: String,
+        stream_name: String,
+        cap: usize,
+    ) {
+        let mut buf = [0u8; 2048];
+        let mut total_bytes = 0;
+
+        while let Ok(bytes_read) = reader.read(&mut buf).await {
+            if bytes_read == 0 {
+                break;
+            }
+            total_bytes += bytes_read;
+
+            if total_bytes > cap {
+                Self::send_log(socket, &job_id, "SYSTEM", "OUTPUT CAP REACHED: Dropping further output").await;
+                break;
+            }
+
+            let text = String::from_utf8_lossy(&buf[..bytes_read]).to_string();
+            Self::send_log(socket.clone(), &job_id, &stream_name, &text).await;
+        }
+    }
+
+    async fn send_log(socket: Arc<Mutex<FramedSocket>>, job_id: &str, stream: &str, text: &str) {
+        let payload = serde_json::to_value(LogPayload {
+            job_id: job_id.to_string(),
+            stream: stream.to_string(),
+            chunk: text.to_string(),
+        }).unwrap();
+
+        let packet = Packet {
+            r#type: "LOG".to_string(),
+            payload,
+        };
+
+        let mut sock = socket.lock().await;
+        let _ = sock.write_packet(&packet).await;
+    }
+}
