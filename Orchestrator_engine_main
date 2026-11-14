@@ -1,0 +1,331 @@
+use std::io::{Read, Write};
+use std::net::TcpStream;
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::thread;
+use std::time::{Duration, Instant};
+
+// =============================================================================
+// JSON STRING BUILDERS (Zero-dependency JSON generation)
+// =============================================================================
+
+fn escape_json(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+fn build_register_packet(worker_id: &str) -> String {
+    format!(
+        r#"{{"type":"REGISTER","payload":{{"worker_id":"{}","slots":1}}}}"#,
+        escape_json(worker_id)
+    )
+}
+
+fn build_heartbeat_packet(worker_id: &str, job_id: &str) -> String {
+    format!(
+        r#"{{"type":"HEARTBEAT","payload":{{"worker_id":"{}","job_id":"{}"}}}}"#,
+        escape_json(worker_id),
+        escape_json(job_id)
+    )
+}
+
+fn build_log_packet(job_id: &str, stream: &str, chunk: &str) -> String {
+    format!(
+        r#"{{"type":"LOG","payload":{{"job_id":"{}","stream":"{}","chunk":"{}"}}}}"#,
+        escape_json(job_id),
+        escape_json(stream),
+        escape_json(chunk)
+    )
+}
+
+fn build_complete_packet(job_id: &str, exit_code: i32) -> String {
+    format!(
+        r#"{{"type":"COMPLETE","payload":{{"job_id":"{}","exit_code":{}}}}}"#,
+        escape_json(job_id),
+        exit_code
+    )
+}
+
+// =============================================================================
+// FAST ASSIGNMENT PARSER (Zero-dependency JSON extraction)
+// =============================================================================
+
+#[derive(Debug)]
+struct JobAssignment {
+    job_id: String,
+    command: String,
+    args: Vec<String>,
+    timeout_ms: u64,
+    output_cap_bytes: usize,
+}
+
+fn extract_string_field(json: &str, key: &str) -> Option<String> {
+    let pattern = format!("\"{}\":\"", key);
+    if let Some(start_idx) = json.find(&pattern) {
+        let val_start = start_idx + pattern.len();
+        if let Some(end_idx) = json[val_start..].find('"') {
+            return Some(json[val_start..val_start + end_idx].to_string());
+        }
+    }
+    None
+}
+
+fn extract_number_field(json: &str, key: &str) -> Option<u64> {
+    let pattern = format!("\"{}\":", key);
+    if let Some(start_idx) = json.find(&pattern) {
+        let val_start = start_idx + pattern.len();
+        let end_idx = json[val_start..]
+            .find(|c: char| !c.is_numeric())
+            .unwrap_or(json.len() - val_start);
+        return json[val_start..val_start + end_idx].trim().parse().ok();
+    }
+    None
+}
+
+fn extract_args_array(json: &str) -> Vec<String> {
+    let mut results = Vec::new();
+    let pattern = "\"args\":[";
+    if let Some(start_idx) = json.find(pattern) {
+        let arr_start = start_idx + pattern.len();
+        if let Some(arr_end) = json[arr_start..].find(']') {
+            let slice = &json[arr_start..arr_start + arr_end];
+            let mut in_str = false;
+            let mut cur = String::new();
+
+            for c in slice.chars() {
+                if c == '"' {
+                    if in_str {
+                        results.push(cur.clone());
+                        cur.clear();
+                        in_str = false;
+                    } else {
+                        in_str = true;
+                    }
+                } else if in_str {
+                    cur.push(c);
+                }
+            }
+        }
+    }
+    results
+}
+
+fn parse_assignment(json: &str) -> Option<JobAssignment> {
+    let job_id = extract_string_field(json, "job_id")?;
+    let command = extract_string_field(json, "command")?;
+    let args = extract_args_array(json);
+    let timeout_ms = extract_number_field(json, "timeout_ms").unwrap_or(30000);
+    let output_cap_bytes = extract_number_field(json, "output_cap_bytes").unwrap_or(1048576) as usize;
+
+    Some(JobAssignment {
+        job_id,
+        command,
+        args,
+        timeout_ms,
+        output_cap_bytes,
+    })
+}
+
+// =============================================================================
+// FRAMED WIRE PROTOCOL (4-byte Big-Endian Length Prefix)
+// =============================================================================
+
+fn send_packet(stream: &mut TcpStream, data: &str) -> std::io::Result<()> {
+    let bytes = data.as_bytes();
+    let len = bytes.len() as u32;
+    stream.write_all(&len.to_be_bytes())?;
+    stream.write_all(bytes)?;
+    stream.flush()?;
+    Ok(())
+}
+
+fn read_packet(stream: &mut TcpStream) -> std::io::Result<String> {
+    let mut len_buf = [0u8; 4];
+    stream.read_exact(&mut len_buf)?;
+    let len = u32::from_be_bytes(len_buf) as usize;
+
+    let mut body = vec![0u8; len];
+    stream.read_exact(&mut body)?;
+    String::from_utf8(body).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
+// =============================================================================
+// SUBPROCESS EXECUTION ENGINE
+// =============================================================================
+
+fn execute_command(
+    mut stream: TcpStream,
+    job: JobAssignment,
+    worker_id: String,
+) -> std::io::Result<()> {
+    println!("[Rust Core Agent] Spawning: {} {:?}", job.command, job.args);
+
+    let mut child = match Command::new(&job.command)
+        .args(&job.args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            let msg = format!("Failed to spawn process: {}", e);
+            send_packet(&mut stream, &build_log_packet(&job.job_id, "SYSTEM", &msg))?;
+            send_packet(&mut stream, &build_complete_packet(&job.job_id, 127))?;
+            return Ok(());
+        }
+    };
+
+    let mut stdout = child.stdout.take().unwrap();
+    let mut stderr = child.stderr.take().unwrap();
+
+    let job_id_clone = job.job_id.clone();
+    let mut stream_stdout = stream.try_clone()?;
+    let cap = job.output_cap_bytes;
+
+    // Stdout streamer thread
+    thread::spawn(move || {
+        let mut buf = [0u8; 1024];
+        let mut total = 0;
+        while let Ok(n) = stdout.read(&mut buf) {
+            if n == 0 { break; }
+            total += n;
+            if total > cap {
+                let _ = send_packet(&mut stream_stdout, &build_log_packet(&job_id_clone, "SYSTEM", "OUTPUT CAP EXCEEDED"));
+                break;
+            }
+            let text = String::from_utf8_lossy(&buf[..n]);
+            let _ = send_packet(&mut stream_stdout, &build_log_packet(&job_id_clone, "STDOUT", &text));
+        }
+    });
+
+    // Stderr streamer thread
+    let job_id_err = job.job_id.clone();
+    let mut stream_stderr = stream.try_clone()?;
+    thread::spawn(move || {
+        let mut buf = [0u8; 1024];
+        let mut total = 0;
+        while let Ok(n) = stderr.read(&mut buf) {
+            if n == 0 { break; }
+            total += n;
+            if total > cap { break; }
+            let text = String::from_utf8_lossy(&buf[..n]);
+            let _ = send_packet(&mut stream_stderr, &build_log_packet(&job_id_err, "STDERR", &text));
+        }
+    });
+
+    // Background heartbeat thread
+    let is_running = Arc::new(AtomicBool::new(true));
+    let is_running_hb = is_running.clone();
+    let mut stream_hb = stream.try_clone()?;
+    let jid_hb = job.job_id.clone();
+    let wid_hb = worker_id.clone();
+
+    thread::spawn(move || {
+        while is_running_hb.load(Ordering::SeqCst) {
+            thread::sleep(Duration::from_secs(4));
+            if !is_running_hb.load(Ordering::SeqCst) { break; }
+            let hb = build_heartbeat_packet(&wid_hb, &jid_hb);
+            if send_packet(&mut stream_hb, &hb).is_err() { break; }
+        }
+    });
+
+    // Wait loop with timeout
+    let start = Instant::now();
+    let timeout = Duration::from_millis(job.timeout_ms);
+    let mut exit_code = 0;
+
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                exit_code = status.code().unwrap_or(0);
+                break;
+            }
+            Ok(None) => {
+                if start.elapsed() > timeout {
+                    let _ = child.kill();
+                    send_packet(&mut stream, &build_log_packet(&job.job_id, "SYSTEM", "TIMED OUT: Exceeded deadline"))?;
+                    exit_code = 124;
+                    break;
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => {
+                let msg = format!("Execution Error: {}", e);
+                send_packet(&mut stream, &build_log_packet(&job.job_id, "SYSTEM", &msg))?;
+                exit_code = 1;
+                break;
+            }
+        }
+    }
+
+    is_running.store(false, Ordering::SeqCst);
+    send_packet(&mut stream, &build_complete_packet(&job.job_id, exit_code))?;
+    println!("[Rust Core Agent] Job {} completed (code: {})", job.job_id, exit_code);
+    Ok(())
+}
+
+// =============================================================================
+// MAIN ENTRY POINT
+// =============================================================================
+
+fn main() {
+    let worker_id = format!("worker-node-{}", std::process::id());
+    println!("[Rust Core Agent] Starting worker: {}", worker_id);
+
+    loop {
+        println!("[Rust Core Agent] Connecting to Go Scheduler at 127.0.0.1:7000...");
+        match TcpStream::connect("127.0.0.1:7000") {
+            Ok(mut stream) => {
+                println!("[Rust Core Agent] Connected! Registering worker...");
+
+                let reg_packet = build_register_packet(&worker_id);
+                if let Err(e) = send_packet(&mut stream, &reg_packet) {
+                    eprintln!("[Rust Core Agent] Registration failed: {}", e);
+                    thread::sleep(Duration::from_secs(2));
+                    continue;
+                }
+
+                loop {
+                    match read_packet(&mut stream) {
+                        Ok(packet_str) => {
+                            if packet_str.contains("\"type\":\"ASSIGN\"") {
+                                if let Some(assignment) = parse_assignment(&packet_str) {
+                                    println!("[Rust Core Agent] Claimed Job: {}", assignment.job_id);
+                                    let exec_stream = match stream.try_clone() {
+                                        Ok(s) => s,
+                                        Err(e) => {
+                                            eprintln!("[Rust Core Agent] Clone error: {}", e);
+                                            break;
+                                        }
+                                    };
+                                    if let Err(e) = execute_command(exec_stream, assignment, worker_id.clone()) {
+                                        eprintln!("[Rust Core Agent] Execution loop failed: {}", e);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("[Rust Core Agent] Connection dropped: {}. Reconnecting...", e);
+                            break;
+                        }
+                    }
+                }
+            }
+            Err(_) => {
+                thread::sleep(Duration::from_secs(2));
+            }
+        }
+    }
+}
