@@ -1,0 +1,95 @@
+use bytes::{Buf, BufMut, BytesMut};
+use serde::{Deserialize, Serialize};
+use std::io::{Error, ErrorKind};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct Packet {
+    pub r#type: String,
+    pub payload: serde_json::Value,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct RegisterPayload {
+    pub worker_id: String,
+    pub slots: usize,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct HeartbeatPayload {
+    pub worker_id: String,
+    pub job_id: String,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct LogPayload {
+    pub job_id: String,
+    pub stream: String,
+    pub chunk: String,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct CompletePayload {
+    pub job_id: String,
+    pub exit_code: i32,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct AssignmentPayload {
+    pub job_id: String,
+    pub command: String,
+    pub args: Vec<String>,
+    pub timeout_ms: u64,
+    pub output_cap_bytes: usize,
+}
+
+pub struct FramedSocket {
+    stream: TcpStream,
+    read_buf: BytesMut,
+}
+
+impl FramedSocket {
+    pub fn new(stream: TcpStream) -> Self {
+        Self {
+            stream,
+            read_buf: BytesMut::with_capacity(65536),
+        }
+    }
+
+    pub async fn read_packet(&mut self) -> Result<Packet, Error> {
+        loop {
+            if self.read_buf.len() >= 4 {
+                let mut length_bytes = [0u8; 4];
+                length_bytes.copy_from_slice(&self.read_buf[..4]);
+                let length = u32::from_be_bytes(length_bytes) as usize;
+
+                if self.read_buf.len() >= 4 + length {
+                    self.read_buf.advance(4);
+                    let payload_bytes = self.read_buf.split_to(length);
+                    let packet: Packet = serde_json::from_slice(&payload_bytes)
+                        .map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
+                    return Ok(packet);
+                }
+            }
+
+            if 0 == self.stream.read_buf(&mut self.read_buf).await? {
+                return Err(Error::new(ErrorKind::UnexpectedEof, "Connection closed"));
+            }
+        }
+    }
+
+    pub async fn write_packet(&mut self, packet: &Packet) -> Result<(), Error> {
+        let json_bytes = serde_json::to_vec(packet)
+            .map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
+        let length = json_bytes.len() as u32;
+
+        let mut buf = BytesMut::with_capacity(4 + json_bytes.len());
+        buf.put_u32(length);
+        buf.put_slice(&json_bytes);
+
+        self.stream.write_all(&buf).await?;
+        self.stream.flush().await?;
+        Ok(())
+    }
+}
