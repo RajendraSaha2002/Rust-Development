@@ -1,0 +1,43 @@
+use crate::protocol::{FramedSocket, HeartbeatPayload, Packet};
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::Mutex;
+use tokio::time::sleep;
+
+pub struct HeartbeatManager;
+
+impl HeartbeatManager {
+    pub fn spawn_loop(
+        socket: Arc<Mutex<FramedSocket>>,
+        worker_id: String,
+        job_id: String,
+        mut stop_rx: tokio::sync::broadcast::Receiver<()>,
+    ) {
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = sleep(Duration::from_secs(4)) => {
+                        let payload = serde_json::to_value(HeartbeatPayload {
+                            worker_id: worker_id.clone(),
+                            job_id: job_id.clone(),
+                        }).unwrap();
+
+                        let packet = Packet {
+                            r#type: "HEARTBEAT".to_string(),
+                            payload,
+                        };
+
+                        let mut sock = socket.lock().await;
+                        if let Err(e) = sock.write_packet(&packet).await {
+                            eprintln!("[Heartbeat Failed]: {}", e);
+                            break;
+                        }
+                    }
+                    _ = stop_rx.recv() => {
+                        break;
+                    }
+                }
+            }
+        });
+    }
+}
